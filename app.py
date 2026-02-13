@@ -1,12 +1,15 @@
+import os
 import json
 from functools import lru_cache
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
 
 import dash
 from dash import dcc, html
-from dash.dependencies import Input, Output
+from dash.dependencies import Input, Output, State
 import dash_bootstrap_components as dbc
 
 import plotly.express as px
@@ -21,24 +24,24 @@ server = app.server
 
 
 # -------------------------
-# Load data
+# Paths
 # -------------------------
 DATA_PATH = "data/italy_smoking_master_mapready.csv"
 GEO_PATH = "assets/italy_regions.geojson"
 
-df = pd.read_csv(DATA_PATH)
 
-# Normalize column names defensively (in case CSV casing differs)
+# -------------------------
+# Load data
+# -------------------------
+df = pd.read_csv(DATA_PATH)
 df.columns = [c.strip() for c in df.columns]
 
-# Expected columns
 COL_REGION = "region"
 COL_YEAR = "year"
 COL_PREV = "prevalence"
 COL_SEX = "sex"
 COL_AGE = "age_group"
 
-# Optional evidence columns
 EVIDENCE_COLS = ["unemployment_rate", "policy_index", "sunshine_hours"]
 
 
@@ -56,8 +59,7 @@ italy_geo = load_geojson()
 # -------------------------
 def safe_unique(series):
     vals = series.dropna().unique().tolist()
-    vals = sorted(vals)
-    return vals
+    return sorted(vals)
 
 
 regions = safe_unique(df[COL_REGION])
@@ -161,35 +163,20 @@ def build_trend_figure(d_a, d_b, region_a, region_b):
 
     if not d_a.empty:
         s_a = d_a.groupby(COL_YEAR, as_index=False)[COL_PREV].mean()
-        fig.add_trace(
-            go.Scatter(
-                x=s_a[COL_YEAR],
-                y=s_a[COL_PREV],
-                mode="lines+markers",
-                name=region_a,
-            )
-        )
+        fig.add_trace(go.Scatter(x=s_a[COL_YEAR], y=s_a[COL_PREV], mode="lines+markers", name=region_a))
 
     if region_b and region_b != region_a and (not d_b.empty):
         s_b = d_b.groupby(COL_YEAR, as_index=False)[COL_PREV].mean()
-        fig.add_trace(
-            go.Scatter(
-                x=s_b[COL_YEAR],
-                y=s_b[COL_PREV],
-                mode="lines+markers",
-                name=region_b,
-            )
-        )
+        fig.add_trace(go.Scatter(x=s_b[COL_YEAR], y=s_b[COL_PREV], mode="lines+markers", name=region_b))
 
     fig.update_layout(
         title=dict(text="Smoking prevalence trend", x=0, xanchor="left", font=dict(size=22)),
-        margin=dict(l=60, r=20, t=70, b=55),  # extra top space avoids title/modebar collision
+        margin=dict(l=60, r=20, t=90, b=55),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     fig.update_xaxes(title_text="Year", showgrid=True)
     fig.update_yaxes(title_text="Prevalence", showgrid=True)
-
     return fig
 
 
@@ -197,7 +184,7 @@ def build_map_figure(df_full, map_year, sex="All", age="All"):
     d = filter_df(df_full, region="All", year_range=(map_year, map_year), sex=sex, age=age)
     if d.empty:
         fig = px.choropleth()
-        fig.update_layout(margin=dict(l=10, r=10, t=70, b=10))
+        fig.update_layout(margin=dict(l=10, r=10, t=90, b=10))
         return fig
 
     by = d.groupby(COL_REGION, as_index=False)[COL_PREV].mean()
@@ -211,25 +198,19 @@ def build_map_figure(df_full, map_year, sex="All", age="All"):
         projection="mercator",
         title="Smoking prevalence map",
     )
-
     fig.update_geos(fitbounds="locations", visible=False)
     fig.update_layout(
-        margin=dict(l=10, r=10, t=70, b=10),  # top space to avoid overlap with modebar
+        margin=dict(l=10, r=10, t=90, b=10),
         coloraxis_colorbar=dict(title=COL_PREV),
     )
     return fig
 
 
 def compute_evidence(df_full, region, year_range=None, sex="All", age="All"):
-    """
-    Evidence = simple correlations + optional linear regression coefficients.
-    Defensive: if columns missing or too few rows, returns safe text.
-    """
     d = filter_df(df_full, region=region, year_range=year_range, sex=sex, age=age)
     if d.empty:
         return {"status": "empty"}
 
-    # ensure numeric
     for c in [COL_PREV] + EVIDENCE_COLS:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
@@ -238,16 +219,14 @@ def compute_evidence(df_full, region, year_range=None, sex="All", age="All"):
     if len(usable_cols) == 0:
         return {"status": "no_evidence_cols"}
 
-    # correlation
     corr = d[[COL_PREV] + usable_cols].corr(numeric_only=True)[COL_PREV].sort_values(ascending=False)
 
-    # simple regression (least squares)
     reg_out = None
     d2 = d[[COL_PREV] + usable_cols].dropna()
     if len(d2) >= max(8, len(usable_cols) * 3):
         X = d2[usable_cols].values
         y = d2[COL_PREV].values
-        X = np.column_stack([np.ones(len(X)), X])  # intercept
+        X = np.column_stack([np.ones(len(X)), X])
 
         beta, *_ = np.linalg.lstsq(X, y, rcond=None)
         yhat = X @ beta
@@ -255,10 +234,8 @@ def compute_evidence(df_full, region, year_range=None, sex="All", age="All"):
         ss_tot = np.sum((y - np.mean(y)) ** 2)
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
 
-        coeffs = pd.DataFrame(
-            {"Feature": usable_cols, "Coefficient": beta[1:]}
-        ).sort_values("Coefficient", key=lambda s: np.abs(s), ascending=False)
-
+        coeffs = pd.DataFrame({"Feature": usable_cols, "Coefficient": beta[1:]})
+        coeffs = coeffs.sort_values("Coefficient", key=lambda s: np.abs(s), ascending=False)
         strongest = coeffs.iloc[0].to_dict()
 
         reg_out = {
@@ -267,12 +244,7 @@ def compute_evidence(df_full, region, year_range=None, sex="All", age="All"):
             "strongest": strongest,
         }
 
-    return {
-        "status": "ok",
-        "corr": corr,
-        "reg": reg_out,
-        "n": int(len(d)),
-    }
+    return {"status": "ok", "corr": corr, "reg": reg_out, "n": int(len(d))}
 
 
 def evidence_panel_layout(evi, region_label):
@@ -289,13 +261,7 @@ def evidence_panel_layout(evi, region_label):
     corr_tbl = pd.DataFrame({"Metric": corr.index, "Correlation": corr.values})
     corr_tbl["Correlation"] = corr_tbl["Correlation"].round(3)
 
-    corr_table = dbc.Table.from_dataframe(
-        corr_tbl,
-        striped=True,
-        bordered=True,
-        hover=True,
-        size="sm",
-    )
+    corr_table = dbc.Table.from_dataframe(corr_tbl, striped=True, bordered=True, hover=True, size="sm")
 
     items = [
         dbc.AccordionItem(
@@ -326,19 +292,10 @@ def evidence_panel_layout(evi, region_label):
                         "Linear model summary: coefficients represent the directional relationship after controlling for other included variables.",
                         className="text-muted",
                     ),
+                    html.Div([html.Strong("Model R²: "), html.Span("—" if r2 is None else f"{r2:.3f}")]),
                     html.Div(
-                        [
-                            html.Strong("Model R²: "),
-                            html.Span("—" if r2 is None else f"{r2:.3f}"),
-                        ],
-                        style={"marginBottom": "10px"},
-                    ),
-                    html.Div(
-                        [
-                            html.Strong("Strongest driver (by absolute coefficient): "),
-                            html.Span(f"{strongest['Feature']} ({strongest['Coefficient']:.4f})"),
-                        ],
-                        style={"marginBottom": "10px"},
+                        [html.Strong("Strongest driver: "), html.Span(f"{strongest['Feature']} ({strongest['Coefficient']:.4f})")],
+                        style={"marginTop": "6px", "marginBottom": "10px"},
                     ),
                     coeff_table,
                 ],
@@ -347,6 +304,118 @@ def evidence_panel_layout(evi, region_label):
         )
 
     return dbc.Accordion(items, start_collapsed=True, always_open=False)
+
+
+# -------------------------
+# OpenAI Chat Helper (safe)
+# -------------------------
+def call_openai_chat(user_question: str, context: str) -> str:
+    """
+    Uses env var OPENAI_API_KEY. No keys are stored in code.
+    If missing key, returns a safe message.
+    """
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # can override in Railway variables
+
+    if not api_key:
+        return "AI Assistant is not configured. Add OPENAI_API_KEY in Railway Variables to enable it."
+
+    # Standard Chat Completions endpoint (works with many setups)
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    system_msg = (
+        "You are a data assistant for a dashboard about smoking prevalence in Italian regions. "
+        "Answer clearly, reference the dashboard filters, and suggest what to look at next. "
+        "Do not invent numbers. If the data is missing, say what is missing."
+    )
+
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{user_question}"},
+        ],
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        if r.status_code != 200:
+            return f"AI request failed (status {r.status_code}). Check Railway logs and your API key/model."
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return "AI request failed due to a network or configuration error. Check Railway logs."
+
+
+def build_context(region_a, region_b, year_range, sex, age, map_year):
+    d_a = filter_df(df, region=region_a, year_range=tuple(year_range), sex=sex, age=age)
+    d_b = filter_df(df, region=region_b, year_range=tuple(year_range), sex=sex, age=age)
+
+    ya, va = latest_year_and_value(d_a)
+    yb, vb = latest_year_and_value(d_b)
+
+    baseline = 2012 if (df[COL_YEAR] == 2012).any() else int(year_range[0])
+    endy = int(year_range[1])
+    ch_a = change_between(d_a, baseline, endy)
+    ch_b = change_between(d_b, baseline, endy)
+
+    ra = national_rank(df, ya, sex=sex, age=age, region=region_a) if ya is not None else None
+    rb = national_rank(df, ya, sex=sex, age=age, region=region_b) if ya is not None else None
+
+    evi = compute_evidence(df, region_a, year_range=tuple(year_range), sex=sex, age=age)
+    strongest_driver = None
+    r2 = None
+    if evi.get("status") == "ok" and evi.get("reg") is not None:
+        strongest_driver = evi["reg"]["strongest"]["Feature"]
+        r2 = evi["reg"]["r2"]
+
+    ctx = f"""
+Filters:
+- Region A: {region_a}
+- Region B: {region_b}
+- Year range: {year_range[0]} to {year_range[1]}
+- Sex: {sex}
+- Age group: {age}
+- Map year: {map_year}
+
+Summary:
+- Latest A: {fmt_pct(va)} (Year {ya})
+- Latest B: {fmt_pct(vb)} (Year {yb})
+- Change A ({baseline}->{endy}): {fmt_pp(ch_a)}
+- Change B ({baseline}->{endy}): {fmt_pp(ch_b)}
+- Rank (latest): A #{ra if ra is not None else "—"} | B #{rb if rb is not None else "—"}
+
+Evidence (Region A focus):
+- Strongest driver (if available): {strongest_driver if strongest_driver else "—"}
+- Model R² (if available): {f"{r2:.3f}" if isinstance(r2, float) else "—"}
+""".strip()
+
+    return ctx
+
+
+def render_chat(history):
+    if not history:
+        return dbc.Alert("Ask a question about Region A/B, the trend, the map year, or what the evidence suggests.", color="secondary")
+
+    bubbles = []
+    for item in history[-12:]:
+        role = item.get("role", "user")
+        text = item.get("content", "")
+        align = "flex-end" if role == "user" else "flex-start"
+        bg = "#f1f3f5" if role == "assistant" else "#e7f5ff"
+        bubbles.append(
+            html.Div(
+                dbc.Card(
+                    dbc.CardBody(text, style={"whiteSpace": "pre-wrap"}),
+                    style={"background": bg, "borderRadius": "14px", "maxWidth": "820px"},
+                ),
+                style={"display": "flex", "justifyContent": align, "marginBottom": "8px"},
+            )
+        )
+
+    return html.Div(bubbles, style={"maxHeight": "340px", "overflowY": "auto", "paddingRight": "6px"})
 
 
 # -------------------------
@@ -452,11 +521,7 @@ app.layout = dbc.Container(
                                         dbc.CardBody(
                                             dcc.Graph(
                                                 id="trend_fig",
-                                                config={
-                                                    "displayModeBar": True,
-                                                    "displaylogo": False,
-                                                    "responsive": True,
-                                                },
+                                                config={"displayModeBar": True, "displaylogo": False, "responsive": True},
                                                 style={"height": "430px"},
                                             )
                                         ),
@@ -469,11 +534,7 @@ app.layout = dbc.Container(
                                         dbc.CardBody(
                                             dcc.Graph(
                                                 id="map_fig",
-                                                config={
-                                                    "displayModeBar": True,
-                                                    "displaylogo": False,
-                                                    "responsive": True,
-                                                },
+                                                config={"displayModeBar": True, "displaylogo": False, "responsive": True},
                                                 style={"height": "430px"},
                                             )
                                         ),
@@ -507,6 +568,51 @@ app.layout = dbc.Container(
                                 )
                             ]
                         ),
+
+                        # AI ASSISTANT
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H4("AI Assistant", style={"fontWeight": "800", "marginBottom": "6px"}),
+                                                html.Div(
+                                                    "Ask a question and get an explanation grounded in your current filters. "
+                                                    "Example: “Why is Region A higher than Region B?” or “What should I check next?”",
+                                                    className="text-muted",
+                                                    style={"marginBottom": "12px"},
+                                                ),
+
+                                                dcc.Store(id="chat_store", data=[]),
+
+                                                html.Div(id="chat_view", style={"marginBottom": "12px"}),
+
+                                                dbc.InputGroup(
+                                                    [
+                                                        dbc.Input(
+                                                            id="chat_input",
+                                                            placeholder="Type a question about the dashboard…",
+                                                            type="text",
+                                                        ),
+                                                        dbc.Button("Send", id="chat_send", color="primary", n_clicks=0),
+                                                    ]
+                                                ),
+
+                                                html.Div(
+                                                    "Note: The assistant activates when OPENAI_API_KEY is set in Railway Variables.",
+                                                    className="text-muted",
+                                                    style={"fontSize": "12px", "marginTop": "8px"},
+                                                ),
+                                            ]
+                                        ),
+                                        style={"borderRadius": "16px", "boxShadow": "0 10px 22px rgba(0,0,0,0.06)"},
+                                    ),
+                                    width=12,
+                                    style={"marginTop": "10px"},
+                                )
+                            ]
+                        ),
                     ],
                     width=9,
                 ),
@@ -514,18 +620,14 @@ app.layout = dbc.Container(
             className="g-3",
         ),
 
-        html.Div(
-            "Built with Dash. Deployed on Railway.",
-            className="text-muted",
-            style={"marginTop": "14px", "marginBottom": "30px"},
-        ),
+        html.Div("Built with Dash. Deployed on Railway.", className="text-muted", style={"marginTop": "14px", "marginBottom": "30px"}),
     ],
     fluid=True,
 )
 
 
 # -------------------------
-# Callback
+# Main dashboard callback
 # -------------------------
 @app.callback(
     Output("trend_fig", "figure"),
@@ -544,36 +646,28 @@ app.layout = dbc.Container(
     Input("age", "value"),
     Input("map_year", "value"),
 )
-def update(region_a, region_b, year_range, sex, age, map_year):
+def update_dashboard(region_a, region_b, year_range, sex, age, map_year):
     d_a = filter_df(df, region=region_a, year_range=tuple(year_range), sex=sex, age=age)
     d_b = filter_df(df, region=region_b, year_range=tuple(year_range), sex=sex, age=age)
 
-    # Trend
     fig_trend = build_trend_figure(d_a, d_b, region_a, region_b)
-
-    # Map
     fig_map = build_map_figure(df, map_year, sex=sex, age=age)
 
-    # KPIs
     ya, va = latest_year_and_value(d_a)
     yb, vb = latest_year_and_value(d_b)
 
     latest_a = kpi_card(
         f"Latest A ({region_a})",
         fmt_pct(va),
-        f"Year {ya}" + (f" • Peak {fmt_pct(peak_year_and_value(d_a)[1])}" if not d_a.empty else ""),
+        f"Year {ya} • Peak {fmt_pct(peak_year_and_value(d_a)[1])}" if not d_a.empty else f"Year {ya}",
     )
     latest_b = kpi_card(
         f"Latest B ({region_b})",
         fmt_pct(vb),
-        f"Year {yb}" + (f" • Peak {fmt_pct(peak_year_and_value(d_b)[1])}" if not d_b.empty else ""),
+        f"Year {yb} • Peak {fmt_pct(peak_year_and_value(d_b)[1])}" if not d_b.empty else f"Year {yb}",
     )
 
-    # Difference at latest comparable year
-    latest_year = None
-    if ya is not None and yb is not None:
-        latest_year = min(ya, yb)
-
+    latest_year = min(ya, yb) if (ya is not None and yb is not None) else None
     diff_pp = None
     if latest_year is not None:
         a_val = d_a[d_a[COL_YEAR] == latest_year][COL_PREV].mean()
@@ -583,7 +677,6 @@ def update(region_a, region_b, year_range, sex, age, map_year):
 
     diff_card = kpi_card("Difference (A - B)", fmt_pp(diff_pp), "Compared at latest available year")
 
-    # Change window (use 2012 baseline if available, else first year in range)
     baseline = 2012 if (df[COL_YEAR] == 2012).any() else int(year_range[0])
     endy = int(year_range[1])
 
@@ -593,7 +686,6 @@ def update(region_a, region_b, year_range, sex, age, map_year):
     change_a = kpi_card(f"Change A ({region_a})", fmt_pp(ch_a), f"{baseline} to {endy}")
     change_b = kpi_card(f"Change B ({region_b})", fmt_pp(ch_b), f"{baseline} to {endy}")
 
-    # Rank latest year
     if ya is not None:
         ra = national_rank(df, ya, sex=sex, age=age, region=region_a)
         rb = national_rank(df, ya, sex=sex, age=age, region=region_b)
@@ -602,21 +694,53 @@ def update(region_a, region_b, year_range, sex, age, map_year):
     else:
         rank_card = kpi_card("National rank (latest)", "—", f"Year {max_year}")
 
-    # Evidence panel (use Region A as default evidence focus)
     evi = compute_evidence(df, region_a, year_range=tuple(year_range), sex=sex, age=age)
     evidence_ui = evidence_panel_layout(evi, region_a)
 
-    return (
-        fig_trend,
-        fig_map,
-        latest_a,
-        latest_b,
-        diff_card,
-        change_a,
-        change_b,
-        rank_card,
-        evidence_ui,
-    )
+    return fig_trend, fig_map, latest_a, latest_b, diff_card, change_a, change_b, rank_card, evidence_ui
+
+
+# -------------------------
+# Chat UI render callback
+# -------------------------
+@app.callback(
+    Output("chat_view", "children"),
+    Input("chat_store", "data"),
+)
+def update_chat_view(chat_history):
+    return render_chat(chat_history)
+
+
+# -------------------------
+# Chat send callback
+# -------------------------
+@app.callback(
+    Output("chat_store", "data"),
+    Input("chat_send", "n_clicks"),
+    State("chat_input", "value"),
+    State("chat_store", "data"),
+    State("region_a", "value"),
+    State("region_b", "value"),
+    State("year_range", "value"),
+    State("sex", "value"),
+    State("age", "value"),
+    State("map_year", "value"),
+    prevent_initial_call=True,
+)
+def on_send(n, user_text, history, region_a, region_b, year_range, sex, age, map_year):
+    history = history or []
+
+    if not user_text or not str(user_text).strip():
+        return history
+
+    user_text = str(user_text).strip()
+    history.append({"role": "user", "content": user_text})
+
+    context = build_context(region_a, region_b, year_range, sex, age, map_year)
+    answer = call_openai_chat(user_text, context)
+
+    history.append({"role": "assistant", "content": answer})
+    return history
 
 
 if __name__ == "__main__":
