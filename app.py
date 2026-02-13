@@ -256,5 +256,8 @@ def update(region, year_range, sex, age, map_year):
     return k1, k2, k3, k4, fig_trend, fig_map
 
 
+import os
+
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    port = int(os.environ.get("PORT", 8050))
+    app.run_server(host="0.0.0.0", port=port, debug=False)
