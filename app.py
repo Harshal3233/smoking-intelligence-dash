@@ -1,668 +1,519 @@
 import os
-import time
 import json
-import textwrap
+import time
 import numpy as np
 import pandas as pd
 
-from dash import Dash, dcc, html, Input, Output, State, callback, no_update
+from dash import Dash, dcc, html, Input, Output, State
 import dash_bootstrap_components as dbc
 import plotly.express as px
-
-# Optional (used for evidence panel regression)
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score
-
-# Optional (AI Assistant)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+import plotly.graph_objects as go
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Config
-# -----------------------------
-APP_TITLE = "Smoking Intelligence Platform"
+# ------------------------------------------------------------
 DATA_PATH = os.getenv("DATA_PATH", "data/italy_smoking_master_mapready.csv")
 GEOJSON_PATH = os.getenv("GEOJSON_PATH", "assets/italy_regions.geojson")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # you set this in Railway Variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-EXPOSE_PORT = int(os.getenv("PORT", "8080"))
-
-PLOT_CONFIG = {
-    "displayModeBar": True,
-    "displaylogo": False,
-    "responsive": True,
-    "scrollZoom": False,
-}
+APP_TITLE = "SMOKING INTELLIGENCE PLATFORM"
+APP_SUBTITLE = "Regional trends, comparative analysis, and forecasting"
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def safe_float(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
+# ------------------------------------------------------------
+# Helpers: data + stats
+# ------------------------------------------------------------
+def safe_read_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing file: {path}")
+    return pd.read_csv(path)
 
 
-def fmt_pct(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
-    return f"{x:.2f}%"
+def safe_read_geojson(path: str) -> dict:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing file: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def fmt_pp(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
-    sign = "+" if x > 0 else ""
-    return f"{sign}{x:.2f} pp"
+def apply_filters(df: pd.DataFrame, region=None, year_min=None, year_max=None, sex=None, age_group=None) -> pd.DataFrame:
+    out = df.copy()
 
-
-def wrap_title(s, width=40):
-    if not s:
-        return ""
-    return "<br>".join(textwrap.wrap(s, width=width))
-
-
-def compute_rank_latest(df, value_col="prevalence"):
-    # rank regions at latest available year in the filtered subset (by sex/age filters etc.)
-    if df.empty:
-        return {}
-    latest_year = int(df["year"].max())
-    d = df[df["year"] == latest_year].copy()
-    if d.empty:
-        return {}
-    d = d.groupby("region", as_index=False)[value_col].mean()
-    d["rank"] = d[value_col].rank(ascending=False, method="min").astype(int)
-    return dict(zip(d["region"], d["rank"])), latest_year
-
-
-def filter_df(df, region=None, region_a=None, region_b=None, year_min=None, year_max=None, sex=None, age_group=None):
-    d = df.copy()
+    if region and region != "All":
+        out = out[out["region"] == region]
 
     if year_min is not None:
-        d = d[d["year"] >= int(year_min)]
+        out = out[out["year"] >= year_min]
     if year_max is not None:
-        d = d[d["year"] <= int(year_max)]
+        out = out[out["year"] <= year_max]
 
-    if sex and sex != "All" and "sex" in d.columns:
-        d = d[d["sex"] == sex]
+    if sex and sex != "All" and "sex" in out.columns:
+        out = out[out["sex"] == sex]
 
-    if age_group and age_group != "All" and "age_group" in d.columns:
-        d = d[d["age_group"] == age_group]
+    if age_group and age_group != "All" and "age_group" in out.columns:
+        out = out[out["age_group"] == age_group]
 
-    # single region mode
-    if region and region != "All":
-        d = d[d["region"] == region]
-
-    # comparison mode
-    if region_a and region_a != "All":
-        pass
-    if region_b and region_b != "All":
-        pass
-
-    return d
+    return out
 
 
-def make_kpi_card(title, value, subtitle):
-    return dbc.Card(
-        dbc.CardBody(
-            [
-                html.Div(title, className="kpi-title"),
-                html.Div(value, className="kpi-value"),
-                html.Div(subtitle, className="kpi-subtitle"),
-            ]
-        ),
-        className="kpi-card",
-    )
+def latest_year(df: pd.DataFrame) -> int:
+    return int(df["year"].max())
 
 
-def load_assets():
-    df = pd.read_csv(DATA_PATH)
-
-    # normalize expected columns
-    df.columns = [c.strip() for c in df.columns]
-    if "Year" in df.columns and "year" not in df.columns:
-        df = df.rename(columns={"Year": "year"})
-    if "Region" in df.columns and "region" not in df.columns:
-        df = df.rename(columns={"Region": "region"})
-
-    # ensure required columns exist
-    required = ["region", "year", "prevalence"]
-    for c in required:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}' in {DATA_PATH}")
-
-    df["year"] = df["year"].astype(int)
-    df["prevalence"] = pd.to_numeric(df["prevalence"], errors="coerce")
-
-    # load geojson
-    with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
-        geo = json.load(f)
-
-    # build region list (prefer data regions)
-    regions = sorted(df["region"].dropna().unique().tolist())
-
-    # optional dimensions
-    sexes = ["All"]
-    if "sex" in df.columns:
-        sexes += sorted([x for x in df["sex"].dropna().unique().tolist() if str(x).strip()])
-
-    ages = ["All"]
-    if "age_group" in df.columns:
-        ages += sorted([x for x in df["age_group"].dropna().unique().tolist() if str(x).strip()])
-
-    year_min = int(df["year"].min())
-    year_max = int(df["year"].max())
-
-    return df, geo, regions, sexes, ages, year_min, year_max
-
-
-DF, ITALY_GEO, REGIONS, SEXES, AGES, YEAR_MIN, YEAR_MAX = load_assets()
-
-DEFAULT_A = "Lazio" if "Lazio" in REGIONS else REGIONS[0]
-DEFAULT_B = "Lombardia" if "Lombardia" in REGIONS else (REGIONS[1] if len(REGIONS) > 1 else REGIONS[0])
-
-
-def build_map(df_for_map, map_year):
-    d = df_for_map[df_for_map["year"] == int(map_year)].copy()
+def region_latest_prevalence(df: pd.DataFrame, region: str, sex="All", age_group="All") -> tuple[float, int]:
+    d = apply_filters(df, region=region, sex=sex, age_group=age_group)
     if d.empty:
-        fig = px.choropleth(title="No data for selected year")
-        fig.update_layout(margin=dict(l=10, r=10, t=40, b=10))
-        return fig
-
-    d = d.groupby("region", as_index=False)["prevalence"].mean()
-
-    # Try common geojson keys
-    candidate_keys = []
-    feat0 = ITALY_GEO.get("features", [{}])[0]
-    props = (feat0.get("properties") or {})
-    for k in ["reg_name", "name", "NAME_1", "region", "Regione"]:
-        if k in props:
-            candidate_keys.append(k)
-    if not candidate_keys:
-        # fall back: guess the first property key
-        candidate_keys = list(props.keys())[:1] if props else ["name"]
-
-    feature_key = f"properties.{candidate_keys[0]}"
-
-    fig = px.choropleth(
-        d,
-        geojson=ITALY_GEO,
-        locations="region",
-        featureidkey=feature_key,
-        color="prevalence",
-        color_continuous_scale="Plasma",
-        title=f"Smoking prevalence map ({int(map_year)})",
-    )
-    fig.update_geos(fitbounds="locations", visible=False)
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=60, b=10),
-        title=dict(x=0.02, y=0.98),
-    )
-    return fig
+        return (np.nan, np.nan)
+    y = latest_year(d)
+    v = float(d[d["year"] == y]["prevalence"].mean())
+    return v, y
 
 
-def build_trend_compare(df_filtered, region_a, region_b, year_min, year_max):
-    if df_filtered.empty:
-        fig = px.line(title="No data for selected filters")
-        fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
-        return fig
-
-    d = df_filtered.copy()
-    d = d[(d["region"].isin([region_a, region_b]))].copy()
+def change_over_period(df: pd.DataFrame, region: str, y0: int, y1: int, sex="All", age_group="All") -> float:
+    d = apply_filters(df, region=region, year_min=y0, year_max=y1, sex=sex, age_group=age_group)
     if d.empty:
-        fig = px.line(title="No data for Region A/B under current filters")
-        fig.update_layout(margin=dict(l=10, r=10, t=60, b=10))
-        return fig
-
-    d = d.groupby(["year", "region"], as_index=False)["prevalence"].mean()
-    title = wrap_title(f"Smoking prevalence trend (Region A vs Region B)", 45)
-
-    fig = px.line(
-        d,
-        x="year",
-        y="prevalence",
-        color="region",
-        markers=True,
-        title=title,
-    )
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=80, b=10),
-        legend_title_text="Region",
-        title=dict(x=0.02),
-    )
-    fig.update_xaxes(dtick=2)
-    fig.update_yaxes(title="Prevalence (%)")
-    return fig
+        return np.nan
+    v0 = d[d["year"] == y0]["prevalence"].mean()
+    v1 = d[d["year"] == y1]["prevalence"].mean()
+    if pd.isna(v0) or pd.isna(v1):
+        return np.nan
+    return float(v1 - v0)
 
 
-def compute_kpis_for_region(df_filtered, region):
-    d = df_filtered[df_filtered["region"] == region].copy()
+def peak_value(df: pd.DataFrame, region: str, sex="All", age_group="All") -> tuple[float, int]:
+    d = apply_filters(df, region=region, sex=sex, age_group=age_group)
     if d.empty:
-        return dict(latest=np.nan, latest_year=np.nan, change=np.nan, change_span="", peak=np.nan, peak_year=np.nan)
-
-    d = d.groupby("year", as_index=False)["prevalence"].mean().sort_values("year")
-    latest_year = int(d["year"].max())
-    latest_val = float(d[d["year"] == latest_year]["prevalence"].iloc[0])
-
-    # change uses first year in selected range
-    first_year = int(d["year"].min())
-    first_val = float(d[d["year"] == first_year]["prevalence"].iloc[0])
-    change = latest_val - first_val
-
-    # peak
+        return (np.nan, np.nan)
     idx = d["prevalence"].idxmax()
-    peak_val = float(d.loc[idx, "prevalence"])
-    peak_year = int(d.loc[idx, "year"])
+    return float(d.loc[idx, "prevalence"]), int(d.loc[idx, "year"])
 
-    return dict(
-        latest=latest_val,
-        latest_year=latest_year,
-        change=change,
-        change_span=f"{first_year} to {latest_year}",
-        peak=peak_val,
-        peak_year=peak_year,
+
+def national_rank_latest(df: pd.DataFrame, region: str, sex="All", age_group="All") -> tuple[int, int]:
+    d = apply_filters(df, sex=sex, age_group=age_group)
+    if d.empty:
+        return (np.nan, np.nan)
+
+    y = latest_year(d)
+    latest = d[d["year"] == y].groupby("region", as_index=False)["prevalence"].mean()
+    latest["rank"] = latest["prevalence"].rank(ascending=False, method="min").astype(int)
+
+    row = latest[latest["region"] == region]
+    if row.empty:
+        return (np.nan, y)
+    return int(row["rank"].iloc[0]), y
+
+
+def corr_table(df: pd.DataFrame, region: str, sex="All", age_group="All") -> pd.DataFrame:
+    d = apply_filters(df, region=region, sex=sex, age_group=age_group)
+    cols = [c for c in ["prevalence", "unemployment_rate", "policy_index", "sunshine_hours", "year"] if c in d.columns]
+    if len(cols) < 2 or d.empty:
+        return pd.DataFrame(columns=["feature", "correlation"])
+    corr = d[cols].corr(numeric_only=True)["prevalence"].drop("prevalence", errors="ignore")
+    out = corr.reset_index()
+    out.columns = ["feature", "correlation"]
+    out["correlation"] = out["correlation"].astype(float)
+    out = out.sort_values("correlation", key=lambda s: s.abs(), ascending=False)
+    return out
+
+
+def linear_regression_numpy(df: pd.DataFrame, region: str, sex="All", age_group="All"):
+    """
+    Simple OLS regression using numpy (no sklearn dependency).
+    Predicts prevalence from available features:
+    unemployment_rate, policy_index, sunshine_hours, year (if present).
+    Returns dict: R2, coefficients table.
+    """
+    d = apply_filters(df, region=region, sex=sex, age_group=age_group).dropna()
+
+    feature_candidates = ["unemployment_rate", "policy_index", "sunshine_hours", "year"]
+    features = [f for f in feature_candidates if f in d.columns]
+
+    if d.empty or len(features) == 0 or "prevalence" not in d.columns:
+        return {"r2": np.nan, "coefficients": pd.DataFrame(columns=["feature", "coefficient"])}
+
+    X = d[features].astype(float).values
+    y = d["prevalence"].astype(float).values.reshape(-1, 1)
+
+    # Add intercept
+    X_design = np.hstack([np.ones((X.shape[0], 1)), X])
+
+    # OLS: beta = (X'X)^-1 X'y
+    try:
+        beta = np.linalg.inv(X_design.T @ X_design) @ (X_design.T @ y)
+    except np.linalg.LinAlgError:
+        beta = np.linalg.pinv(X_design) @ y
+
+    y_hat = X_design @ beta
+    ss_res = float(((y - y_hat) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+    coef = beta[1:].flatten()
+    coef_df = pd.DataFrame({"feature": features, "coefficient": coef.astype(float)})
+    coef_df = coef_df.sort_values("coefficient", key=lambda s: s.abs(), ascending=False)
+
+    return {"r2": float(r2), "coefficients": coef_df}
+
+
+def evidence_summary_text(region: str, r2: float, coef_df: pd.DataFrame) -> str:
+    if coef_df.empty or pd.isna(r2):
+        return f"No regression evidence available for {region} with the current filters."
+
+    top = coef_df.iloc[0]
+    driver = str(top["feature"])
+    effect = float(top["coefficient"])
+
+    direction = "increases" if effect > 0 else "decreases"
+    return (
+        f"For {region}, the strongest structural driver in the linear model is **{driver}** "
+        f"(coefficient {effect:+.3f}), meaning higher {driver} {direction} predicted prevalence in this dataset. "
+        f"Model fit: **R² = {r2:.2f}**."
     )
 
 
-def evidence_panel_data(df_scope):
-    # Evidence based on the currently filtered dataset (not just A/B),
-    # using the latest year available within df_scope.
-    if df_scope.empty:
-        return None
-
-    latest_year = int(df_scope["year"].max())
-    d = df_scope[df_scope["year"] == latest_year].copy()
-    if d.empty:
-        return None
-
-    # correlation candidates
-    feature_candidates = []
-    for c in ["unemployment_rate", "policy_index", "sunshine_hours"]:
-        if c in d.columns:
-            feature_candidates.append(c)
-
-    # Correlations (region-level)
-    corr_rows = []
-    d_region = d.groupby("region", as_index=False)[["prevalence"] + feature_candidates].mean(numeric_only=True)
-
-    if len(d_region) >= 3 and feature_candidates:
-        corr = d_region[["prevalence"] + feature_candidates].corr(numeric_only=True)["prevalence"].drop("prevalence")
-        for feat, val in corr.items():
-            corr_rows.append((feat, safe_float(val)))
-
-    # Regression (simple linear regression)
-    reg_result = None
-    if len(d_region) >= 5 and feature_candidates:
-        X = d_region[feature_candidates].fillna(d_region[feature_candidates].median(numeric_only=True))
-        y = d_region["prevalence"].values
-        model = LinearRegression()
-        model.fit(X, y)
-        yhat = model.predict(X)
-        r2 = r2_score(y, yhat)
-        coefs = list(zip(feature_candidates, model.coef_.tolist()))
-        # strongest driver by absolute coefficient
-        strongest = max(coefs, key=lambda t: abs(t[1])) if coefs else (None, None)
-        reg_result = {
-            "latest_year": latest_year,
-            "r2": float(r2),
-            "coefs": coefs,
-            "strongest_driver": strongest[0],
-            "strongest_coef": float(strongest[1]) if strongest[1] is not None else None,
-        }
-
-    return {
-        "latest_year": latest_year,
-        "corr_rows": corr_rows,
-        "reg": reg_result,
-        "features": feature_candidates,
-    }
-
-
-# -----------------------------
-# OpenAI: safe call with retries (429 handling)
-# -----------------------------
-def call_openai_chat(system_msg, user_msg, max_tokens=350, temperature=0.25):
+# ------------------------------------------------------------
+# OpenAI helper (optional)
+# ------------------------------------------------------------
+def ai_answer(question: str, context: str) -> tuple[bool, str]:
     """
-    Uses OPENAI_API_KEY + OPENAI_MODEL from environment.
-    Retries on 429 rate limit with short backoff.
-    Returns (ok: bool, text: str)
+    Returns (ok, text). If not configured or errors, returns ok=False with message.
     """
-    if not OPENAI_API_KEY or not OpenAI:
+    if not OPENAI_API_KEY:
         return False, "AI Assistant is not configured. Add OPENAI_API_KEY in Railway Variables to enable it."
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        return False, "Missing dependency: openai. Add `openai` to requirements.txt."
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    last_err = None
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            text = resp.choices[0].message.content.strip()
-            return True, text
-        except Exception as e:
-            last_err = str(e)
-            # Rate limit / throttling
-            if "429" in last_err or "rate" in last_err.lower():
-                time.sleep(2 * (attempt + 1))
-                continue
-            break
+    system = (
+        "You are a data analyst assistant for a Dash dashboard about smoking prevalence in Italian regions. "
+        "Answer using the provided context only. Be concise, factual, and reference the numbers given."
+    )
 
-    return False, f"AI request failed. {last_err}"
+    user = f"Context:\n{context}\n\nUser question:\n{question}"
+
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_output_tokens=350,
+        )
+        text = resp.output_text.strip()
+        return True, text if text else "No response text returned."
+    except Exception as e:
+        msg = str(e)
+        # Helpful handling for rate limits
+        if "429" in msg or "rate limit" in msg.lower():
+            return False, "AI request failed (status 429). You hit a rate limit or quota. Try again later or lower usage."
+        return False, f"AI request failed: {msg}"
 
 
-# -----------------------------
-# App + Styling
-# -----------------------------
-app = Dash(
-    __name__,
-    external_stylesheets=[dbc.themes.BOOTSTRAP],
-    title=APP_TITLE,
-    suppress_callback_exceptions=True,
-)
+# ------------------------------------------------------------
+# Load data
+# ------------------------------------------------------------
+df = safe_read_csv(DATA_PATH)
+df["year"] = df["year"].astype(int)
+
+italy_geo = safe_read_geojson(GEOJSON_PATH)
+
+regions = sorted(df["region"].dropna().unique().tolist())
+
+sex_values = ["All"] + (sorted(df["sex"].dropna().unique().tolist()) if "sex" in df.columns else [])
+age_values = ["All"] + (sorted(df["age_group"].dropna().unique().tolist()) if "age_group" in df.columns else [])
+
+min_year = int(df["year"].min())
+max_year = int(df["year"].max())
+
+
+# Defaults
+default_a = regions[0] if regions else "All"
+default_b = regions[1] if len(regions) > 1 else default_a
+
+
+# ------------------------------------------------------------
+# App + styling
+# ------------------------------------------------------------
+external_stylesheets = [dbc.themes.BOOTSTRAP]
+app = Dash(__name__, external_stylesheets=external_stylesheets)
 server = app.server
 
-GLOBAL_CSS = """
-:root{
-  --card-radius: 16px;
-  --card-border: rgba(0,0,0,.12);
-  --shadow: 0 6px 18px rgba(0,0,0,.08);
-}
-body{ background:#fff; }
-.container-max{ max-width: 1320px; margin: 0 auto; padding: 26px 18px 40px; }
-
-.h-title{ font-size: 34px; letter-spacing: .12em; font-weight: 700; margin: 0; }
-.h-sub{ color: rgba(0,0,0,.55); margin-top: 8px; }
-
-.panel-card{
-  border: 1px solid var(--card-border);
-  border-radius: var(--card-radius);
-  box-shadow: var(--shadow);
+GRAPH_CONFIG = {
+    "displayModeBar": True,
+    "displaylogo": False,
+    # Removes clutter so it doesn't overlap headings
+    "modeBarButtonsToRemove": [
+        "zoom2d", "pan2d", "select2d", "lasso2d",
+        "autoScale2d", "resetScale2d",
+        "toggleSpikelines", "hoverCompareCartesian", "hoverClosestCartesian"
+    ],
+    "responsive": True,
 }
 
-.kpi-card{
-  border: 1px solid var(--card-border);
-  border-radius: var(--card-radius);
-  box-shadow: var(--shadow);
-}
-.kpi-title{ color: rgba(0,0,0,.6); font-size: 15px; }
-.kpi-value{ font-size: 34px; font-weight: 700; line-height: 1.08; margin-top: 6px; }
-.kpi-subtitle{ color: rgba(0,0,0,.55); margin-top: 6px; }
-
-.filters-title{ font-size: 18px; font-weight: 700; margin-bottom: 10px; }
-.filter-label{ color: rgba(0,0,0,.65); margin-top: 10px; margin-bottom: 6px; }
-
-.graph-card{
-  border: 1px solid var(--card-border);
-  border-radius: var(--card-radius);
-  box-shadow: var(--shadow);
-  padding: 14px 14px 10px;
+CARD_STYLE = {
+    "borderRadius": "14px",
+    "boxShadow": "0 6px 18px rgba(0,0,0,0.06)",
+    "border": "1px solid rgba(0,0,0,0.08)",
 }
 
-.graph-title{
-  font-size: 22px;
-  font-weight: 700;
-  margin: 6px 0 10px 4px;
-}
+SECTION_TITLE = {"fontSize": "22px", "fontWeight": 600, "marginBottom": "8px"}
+MUTED = {"color": "rgba(0,0,0,0.55)"}
 
-.small-note{ color: rgba(0,0,0,.55); font-size: 13px; margin-top: 8px; }
 
-.ai-card{
-  border: 1px solid var(--card-border);
-  border-radius: var(--card-radius);
-  box-shadow: var(--shadow);
-  padding: 16px;
-}
+def kpi_card(title, value, subtitle=None):
+    return dbc.Card(
+        dbc.CardBody(
+            [
+                html.Div(title, style={**MUTED, "fontSize": "14px"}),
+                html.Div(value, style={"fontSize": "34px", "fontWeight": 650, "lineHeight": "1.1"}),
+                html.Div(subtitle or "", style={**MUTED, "marginTop": "6px"}) if subtitle else html.Div(),
+            ]
+        ),
+        style=CARD_STYLE,
+    )
 
-.ai-title{ font-size: 28px; font-weight: 800; margin: 0; }
-.ai-sub{ color: rgba(0,0,0,.65); margin-top: 8px; }
 
-.modebar{ transform: translateY(10px); } /* pushes the plotly toolbar down slightly */
-.js-plotly-plot .plotly .modebar{ top: 10px !important; } /* avoid overlapping titles */
-"""
-
-app.layout = html.Div(
-    [
-        html.Style(GLOBAL_CSS),
+# ------------------------------------------------------------
+# Layout
+# ------------------------------------------------------------
+app.layout = dbc.Container(
+    fluid=True,
+    style={"padding": "22px 26px"},
+    children=[
         html.Div(
-            className="container-max",
-            children=[
-                html.H1(APP_TITLE.upper(), className="h-title"),
-                html.Div("Regional trends, comparative analysis, and forecasting", className="h-sub"),
-                html.Div(style={"height": "18px"}),
+            [
+                html.Div(APP_TITLE, style={"letterSpacing": "0.12em", "fontSize": "30px", "fontWeight": 700}),
+                html.Div(APP_SUBTITLE, style={**MUTED, "marginTop": "4px"}),
+            ],
+            style={"marginBottom": "18px"},
+        ),
 
-                dbc.Row(
-                    [
-                        # Sidebar
-                        dbc.Col(
-                            dbc.Card(
-                                dbc.CardBody(
-                                    [
-                                        html.Div("Filters", className="filters-title"),
-
-                                        html.Div("Region A", className="filter-label"),
-                                        dcc.Dropdown(
-                                            id="region_a",
-                                            options=[{"label": r, "value": r} for r in REGIONS],
-                                            value=DEFAULT_A,
-                                            clearable=False,
-                                        ),
-
-                                        html.Div("Region B", className="filter-label"),
-                                        dcc.Dropdown(
-                                            id="region_b",
-                                            options=[{"label": r, "value": r} for r in REGIONS],
-                                            value=DEFAULT_B,
-                                            clearable=False,
-                                        ),
-
-                                        html.Div("Year range", className="filter-label"),
-                                        dcc.RangeSlider(
-                                            id="year_range",
-                                            min=YEAR_MIN,
-                                            max=YEAR_MAX,
-                                            step=1,
-                                            value=[max(YEAR_MIN, YEAR_MAX - 14), YEAR_MAX],
-                                            marks={YEAR_MIN: str(YEAR_MIN), YEAR_MAX: str(YEAR_MAX)},
-                                            allowCross=False,
-                                        ),
-
-                                        html.Div("Sex", className="filter-label"),
-                                        dcc.Dropdown(
-                                            id="sex",
-                                            options=[{"label": s, "value": s} for s in SEXES],
-                                            value="All",
-                                            clearable=False,
-                                        ),
-
-                                        html.Div("Age group", className="filter-label"),
-                                        dcc.Dropdown(
-                                            id="age_group",
-                                            options=[{"label": a, "value": a} for a in AGES],
-                                            value="All",
-                                            clearable=False,
-                                        ),
-
-                                        html.Div("Map year", className="filter-label"),
-                                        dcc.Slider(
-                                            id="map_year",
-                                            min=YEAR_MIN,
-                                            max=YEAR_MAX,
-                                            step=1,
-                                            value=YEAR_MAX,
-                                            marks={YEAR_MIN: str(YEAR_MIN), YEAR_MAX: str(YEAR_MAX)},
-                                        ),
-
-                                        html.Div(className="small-note", children="Tip: Region A vs Region B compares trends using the same filters."),
-                                    ]
-                                ),
-                                className="panel-card",
-                            ),
-                            width=3,
-                        ),
-
-                        # Main
-                        dbc.Col(
+        dbc.Row(
+            [
+                # Sidebar
+                dbc.Col(
+                    dbc.Card(
+                        dbc.CardBody(
                             [
-                                # KPI row
-                                dbc.Row(
-                                    [
-                                        dbc.Col(html.Div(id="kpi_a_latest"), width=2),
-                                        dbc.Col(html.Div(id="kpi_b_latest"), width=2),
-                                        dbc.Col(html.Div(id="kpi_diff"), width=2),
-                                        dbc.Col(html.Div(id="kpi_a_change"), width=2),
-                                        dbc.Col(html.Div(id="kpi_b_change"), width=2),
-                                        dbc.Col(html.Div(id="kpi_rank"), width=2),
-                                    ],
-                                    className="g-3",
-                                ),
-                                html.Div(style={"height": "14px"}),
+                                html.Div("Filters", style={"fontWeight": 650, "marginBottom": "10px"}),
 
-                                dbc.Row(
-                                    [
-                                        dbc.Col(
-                                            dbc.Card(
-                                                [
-                                                    html.Div("Smoking prevalence trend (A vs B)", className="graph-title"),
-                                                    dcc.Graph(id="trend_graph", config=PLOT_CONFIG, style={"height": "460px"}),
-                                                ],
-                                                className="graph-card",
-                                            ),
-                                            width=7,
-                                        ),
-                                        dbc.Col(
-                                            dbc.Card(
-                                                [
-                                                    html.Div(id="map_title", className="graph-title"),
-                                                    dcc.Graph(id="map_graph", config=PLOT_CONFIG, style={"height": "460px"}),
-                                                ],
-                                                className="graph-card",
-                                            ),
-                                            width=5,
-                                        ),
-                                    ],
-                                    className="g-3",
+                                dbc.Label("Region A"),
+                                dcc.Dropdown(
+                                    id="region_a",
+                                    options=[{"label": r, "value": r} for r in regions],
+                                    value=default_a,
+                                    clearable=False,
                                 ),
 
-                                html.Div(style={"height": "16px"}),
-
-                                # Evidence Panel
-                                dbc.Card(
-                                    dbc.CardBody(
-                                        [
-                                            html.Div("Evidence Panel", className="graph-title"),
-                                            dbc.Accordion(
-                                                [
-                                                    dbc.AccordionItem(
-                                                        html.Div(id="evidence_corr"),
-                                                        title="Correlations",
-                                                    ),
-                                                    dbc.AccordionItem(
-                                                        html.Div(id="evidence_reg"),
-                                                        title="Regression Evidence",
-                                                    ),
-                                                ],
-                                                start_collapsed=True,
-                                                flush=True,
-                                            ),
-                                            html.Div(className="small-note", children="Evidence updates using your current filters (sex/age/year range)."),
-                                        ]
-                                    ),
-                                    className="panel-card",
-                                ),
-
-                                html.Div(style={"height": "16px"}),
-
-                                # AI Assistant
-                                dbc.Card(
-                                    dbc.CardBody(
-                                        [
-                                            html.Div("AI Assistant", className="ai-title"),
-                                            html.Div(
-                                                "Ask a question and get an explanation grounded in your current filters. "
-                                                'Example: "Why is Region A higher than Region B?" or "What should I check next?"',
-                                                className="ai-sub",
-                                            ),
-                                            html.Div(style={"height": "10px"}),
-
-                                            dbc.Alert(
-                                                id="ai_status",
-                                                children="Note: The assistant activates when OPENAI_API_KEY is set in Railway Variables.",
-                                                color="secondary",
-                                                className="mb-3",
-                                            ),
-
-                                            dbc.Row(
-                                                [
-                                                    dbc.Col(
-                                                        dcc.Input(
-                                                            id="ai_input",
-                                                            type="text",
-                                                            placeholder="Type your question...",
-                                                            style={"width": "100%", "height": "44px", "padding": "10px", "borderRadius": "10px"},
-                                                        ),
-                                                        width=9,
-                                                    ),
-                                                    dbc.Col(
-                                                        dbc.Button("Send", id="ai_send", color="primary", style={"width": "100%", "height": "44px"}),
-                                                        width=3,
-                                                    ),
-                                                ],
-                                                className="g-2",
-                                            ),
-
-                                            html.Div(style={"height": "12px"}),
-                                            dbc.Card(
-                                                dbc.CardBody(html.Div(id="ai_output", children="")),
-                                                style={"borderRadius": "14px", "border": "1px solid rgba(0,0,0,.12)"},
-                                            ),
-                                        ]
-                                    ),
-                                    className="ai-card",
+                                dbc.Label("Region B", style={"marginTop": "10px"}),
+                                dcc.Dropdown(
+                                    id="region_b",
+                                    options=[{"label": r, "value": r} for r in regions],
+                                    value=default_b,
+                                    clearable=False,
                                 ),
 
                                 html.Div(style={"height": "10px"}),
-                                html.Div("Built with Dash. Deployed on Railway.", className="small-note"),
-                            ],
-                            width=9,
+
+                                dbc.Label("Year range"),
+                                dcc.RangeSlider(
+                                    id="year_range",
+                                    min=min_year,
+                                    max=max_year,
+                                    value=[min_year, max_year],
+                                    marks={min_year: str(min_year), max_year: str(max_year)},
+                                    allowCross=False,
+                                ),
+
+                                dbc.Label("Sex", style={"marginTop": "12px"}),
+                                dcc.Dropdown(
+                                    id="sex",
+                                    options=[{"label": s, "value": s} for s in sex_values],
+                                    value="All",
+                                    clearable=False,
+                                ),
+
+                                dbc.Label("Age group", style={"marginTop": "10px"}),
+                                dcc.Dropdown(
+                                    id="age_group",
+                                    options=[{"label": a, "value": a} for a in age_values],
+                                    value="All",
+                                    clearable=False,
+                                ),
+
+                                dbc.Label("Map year", style={"marginTop": "14px"}),
+                                dcc.Slider(
+                                    id="map_year",
+                                    min=min_year,
+                                    max=max_year,
+                                    value=max_year,
+                                    marks={min_year: str(min_year), max_year: str(max_year)},
+                                ),
+                            ]
                         ),
+                        style={**CARD_STYLE, "height": "100%"},
+                    ),
+                    md=3,
+                ),
+
+                # Main content
+                dbc.Col(
+                    [
+                        # KPI row
+                        dbc.Row(
+                            [
+                                dbc.Col(kpi_card("Latest A", "—", " "), md=2, id="kpi_latest_a"),
+                                dbc.Col(kpi_card("Latest B", "—", " "), md=2, id="kpi_latest_b"),
+                                dbc.Col(kpi_card("Difference (A - B)", "—", "Compared at latest year"), md=2, id="kpi_diff"),
+                                dbc.Col(kpi_card("Change A", "—", f"{min_year} to {max_year}"), md=2, id="kpi_change_a"),
+                                dbc.Col(kpi_card("Change B", "—", f"{min_year} to {max_year}"), md=2, id="kpi_change_b"),
+                                dbc.Col(kpi_card("National rank (latest)", "—", f"Year {max_year}"), md=2, id="kpi_rank"),
+                            ],
+                            className="g-3",
+                            style={"marginBottom": "16px"},
+                        ),
+
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    [
+                                        html.Div("Smoking prevalence trend (Region A vs Region B)", style=SECTION_TITLE),
+                                        dcc.Graph(id="trend_graph", config=GRAPH_CONFIG, style={"height": "420px"}),
+                                    ],
+                                    md=7,
+                                ),
+                                dbc.Col(
+                                    [
+                                        html.Div(id="map_title", style=SECTION_TITLE),
+                                        dcc.Graph(id="map_graph", config=GRAPH_CONFIG, style={"height": "420px"}),
+                                    ],
+                                    md=5,
+                                ),
+                            ],
+                            className="g-4",
+                        ),
+
+                        html.Hr(style={"margin": "18px 0"}),
+
+                        # Evidence Panel
+                        dbc.Card(
+                            dbc.CardBody(
+                                [
+                                    html.Div("Evidence panel", style={"fontSize": "24px", "fontWeight": 700, "marginBottom": "6px"}),
+                                    html.Div(
+                                        "Evidence is computed from your current filters (Region A, Sex, Age group). "
+                                        "Use it to justify comparisons with numbers, not vibes.",
+                                        style={**MUTED, "marginBottom": "14px"},
+                                    ),
+
+                                    dbc.Accordion(
+                                        [
+                                            dbc.AccordionItem(
+                                                [
+                                                    html.Div(id="corr_title", style={"fontWeight": 650, "marginBottom": "10px"}),
+                                                    dcc.Graph(id="corr_bar", config=GRAPH_CONFIG, style={"height": "300px"}),
+                                                ],
+                                                title="Correlations",
+                                            ),
+                                            dbc.AccordionItem(
+                                                [
+                                                    html.Div(id="reg_title", style={"fontWeight": 650, "marginBottom": "10px"}),
+                                                    dcc.Graph(id="reg_coef", config=GRAPH_CONFIG, style={"height": "300px"}),
+                                                    html.Div(id="reg_summary", style={"marginTop": "10px"}),
+                                                ],
+                                                title="Regression evidence",
+                                            ),
+                                        ],
+                                        start_collapsed=True,
+                                    ),
+                                ]
+                            ),
+                            style=CARD_STYLE,
+                        ),
+
+                        html.Hr(style={"margin": "18px 0"}),
+
+                        # AI Assistant
+                        dbc.Card(
+                            dbc.CardBody(
+                                [
+                                    html.Div("AI Assistant", style={"fontSize": "26px", "fontWeight": 750, "marginBottom": "6px"}),
+                                    html.Div(
+                                        "Ask a question and get an explanation grounded in your current filters. "
+                                        'Example: "Why is Region A higher than Region B?" or "What should I check next?"',
+                                        style={**MUTED, "marginBottom": "10px"},
+                                    ),
+
+                                    dbc.Alert(id="ai_status", color="secondary", children="", is_open=False),
+
+                                    dbc.Row(
+                                        [
+                                            dbc.Col(
+                                                dcc.Input(
+                                                    id="ai_question",
+                                                    type="text",
+                                                    placeholder="Type your question...",
+                                                    style={"width": "100%", "padding": "12px", "borderRadius": "10px"},
+                                                ),
+                                                md=9,
+                                            ),
+                                            dbc.Col(
+                                                dbc.Button("Send", id="ai_send", color="primary", style={"width": "100%", "padding": "12px"}),
+                                                md=3,
+                                            ),
+                                        ],
+                                        className="g-2",
+                                    ),
+
+                                    html.Div(id="ai_answer", style={"whiteSpace": "pre-wrap", "marginTop": "12px"}),
+                                    html.Div(
+                                        "Note: The assistant activates when OPENAI_API_KEY is set in Railway Variables. "
+                                        f"Model: {OPENAI_MODEL}",
+                                        style={**MUTED, "marginTop": "8px", "fontSize": "13px"},
+                                    ),
+                                ]
+                            ),
+                            style=CARD_STYLE,
+                        ),
+
+                        html.Div(style={"height": "20px"}),
+                        html.Div("Built with Dash. Deployed on Railway.", style={**MUTED, "fontSize": "13px"}),
                     ],
-                    className="g-3",
+                    md=9,
                 ),
             ],
+            className="g-4",
         ),
-    ]
+    ],
 )
 
 
-# -----------------------------
-# Main dashboard callback
-# -----------------------------
-@callback(
-    Output("kpi_a_latest", "children"),
-    Output("kpi_b_latest", "children"),
+# ------------------------------------------------------------
+# Callbacks
+# ------------------------------------------------------------
+@app.callback(
+    Output("kpi_latest_a", "children"),
+    Output("kpi_latest_b", "children"),
     Output("kpi_diff", "children"),
-    Output("kpi_a_change", "children"),
-    Output("kpi_b_change", "children"),
+    Output("kpi_change_a", "children"),
+    Output("kpi_change_b", "children"),
     Output("kpi_rank", "children"),
     Output("trend_graph", "figure"),
     Output("map_graph", "figure"),
     Output("map_title", "children"),
-    Output("evidence_corr", "children"),
-    Output("evidence_reg", "children"),
+    Output("corr_title", "children"),
+    Output("corr_bar", "figure"),
+    Output("reg_title", "children"),
+    Output("reg_coef", "figure"),
+    Output("reg_summary", "children"),
     Input("region_a", "value"),
     Input("region_b", "value"),
     Input("year_range", "value"),
@@ -673,150 +524,128 @@ app.layout = html.Div(
 def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
     y0, y1 = int(year_range[0]), int(year_range[1])
 
-    df_filtered = filter_df(
-        DF,
-        year_min=y0,
-        year_max=y1,
-        sex=sex,
-        age_group=age_group,
-    )
+    # KPI numbers
+    a_latest, a_y = region_latest_prevalence(df, region_a, sex=sex, age_group=age_group)
+    b_latest, b_y = region_latest_prevalence(df, region_b, sex=sex, age_group=age_group)
 
-    # KPIs per region
-    kpi_a = compute_kpis_for_region(df_filtered, region_a)
-    kpi_b = compute_kpis_for_region(df_filtered, region_b)
+    latest_year_used = int(max(a_y, b_y)) if not pd.isna(a_y) and not pd.isna(b_y) else max_year
+    diff = (a_latest - b_latest) if (not pd.isna(a_latest) and not pd.isna(b_latest)) else np.nan
 
-    # latest diff at each region's latest within filter
-    latest_year = int(max(safe_float(kpi_a["latest_year"], -1), safe_float(kpi_b["latest_year"], -1)))
-    diff_latest = (kpi_a["latest"] - kpi_b["latest"]) if np.isfinite(kpi_a["latest"]) and np.isfinite(kpi_b["latest"]) else np.nan
+    a_change = change_over_period(df, region_a, y0, y1, sex=sex, age_group=age_group)
+    b_change = change_over_period(df, region_b, y0, y1, sex=sex, age_group=age_group)
 
-    # Rank at latest available year within filtered dataset (region-level)
-    rank_map, rank_year = compute_rank_latest(df_filtered)
-    ra = rank_map.get(region_a, None)
-    rb = rank_map.get(region_b, None)
+    a_peak, a_peak_year = peak_value(df, region_a, sex=sex, age_group=age_group)
+    b_peak, b_peak_year = peak_value(df, region_b, sex=sex, age_group=age_group)
 
-    # Build KPI cards
-    kpi_a_latest = make_kpi_card(
+    a_rank, rank_year = national_rank_latest(df, region_a, sex=sex, age_group=age_group)
+    b_rank, _ = national_rank_latest(df, region_b, sex=sex, age_group=age_group)
+
+    # KPI cards
+    kpi_a = kpi_card(
         f"Latest A ({region_a})",
-        fmt_pct(kpi_a["latest"]),
-        f"Year {kpi_a['latest_year']} • Peak {fmt_pct(kpi_a['peak'])} ({kpi_a['peak_year']})",
+        f"{a_latest:.2f}%" if not pd.isna(a_latest) else "—",
+        f"Year {a_y} • Peak {a_peak:.2f}% ({a_peak_year})" if not pd.isna(a_y) else " ",
     )
-    kpi_b_latest = make_kpi_card(
+    kpi_b = kpi_card(
         f"Latest B ({region_b})",
-        fmt_pct(kpi_b["latest"]),
-        f"Year {kpi_b['latest_year']} • Peak {fmt_pct(kpi_b['peak'])} ({kpi_b['peak_year']})",
+        f"{b_latest:.2f}%" if not pd.isna(b_latest) else "—",
+        f"Year {b_y} • Peak {b_peak:.2f}% ({b_peak_year})" if not pd.isna(b_y) else " ",
     )
-    kpi_diff = make_kpi_card(
+    kpi_d = kpi_card(
         "Difference (A - B)",
-        fmt_pp(diff_latest),
+        f"{diff:+.2f} pp" if not pd.isna(diff) else "—",
         "Compared at latest available year",
     )
-    kpi_a_change = make_kpi_card(
+    kpi_ca = kpi_card(
         f"Change A ({region_a})",
-        fmt_pp(kpi_a["change"]),
-        kpi_a["change_span"],
+        f"{a_change:+.2f} pp" if not pd.isna(a_change) else "—",
+        f"{y0} to {y1}",
     )
-    kpi_b_change = make_kpi_card(
+    kpi_cb = kpi_card(
         f"Change B ({region_b})",
-        fmt_pp(kpi_b["change"]),
-        kpi_b["change_span"],
+        f"{b_change:+.2f} pp" if not pd.isna(b_change) else "—",
+        f"{y0} to {y1}",
     )
-    kpi_rank = make_kpi_card(
+    kpi_r = kpi_card(
         "National rank (latest)",
-        f"A #{ra} | B #{rb}" if (ra is not None and rb is not None) else "—",
-        f"Year {rank_year}" if "rank_year" in locals() and rank_year else f"Year {y1}",
+        f"A #{a_rank} | B #{b_rank}" if (not pd.isna(a_rank) and not pd.isna(b_rank)) else "—",
+        f"Year {rank_year}",
     )
 
-    # Figures
-    fig_trend = build_trend_compare(df_filtered, region_a, region_b, y0, y1)
-    fig_map = build_map(df_filtered, map_year)
-    map_title = f"Smoking prevalence map ({int(map_year)})"
+    # Trend figure (ensure title never "cuts")
+    d_trend = apply_filters(df, year_min=y0, year_max=y1, sex=sex, age_group=age_group)
+    d_a = d_trend[d_trend["region"] == region_a].groupby("year", as_index=False)["prevalence"].mean()
+    d_b = d_trend[d_trend["region"] == region_b].groupby("year", as_index=False)["prevalence"].mean()
 
-    # Evidence panel
-    ev = evidence_panel_data(df_filtered)
-    if not ev:
-        corr_block = dbc.Alert("No evidence available for the current filters.", color="secondary")
-        reg_block = dbc.Alert("No regression evidence available for the current filters.", color="secondary")
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(x=d_a["year"], y=d_a["prevalence"], mode="lines+markers", name=region_a))
+    fig_trend.add_trace(go.Scatter(x=d_b["year"], y=d_b["prevalence"], mode="lines+markers", name=region_b))
+
+    fig_trend.update_layout(
+        margin=dict(l=55, r=20, t=20, b=45),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        xaxis_title="year",
+        yaxis_title="Prevalence",
+        hovermode="x unified",
+    )
+
+    # Map figure for selected year
+    d_map = apply_filters(df, year_min=map_year, year_max=map_year, sex=sex, age_group=age_group)
+    d_map = d_map.groupby("region", as_index=False)["prevalence"].mean()
+
+    fig_map = px.choropleth(
+        d_map,
+        geojson=italy_geo,
+        locations="region",
+        featureidkey="properties.reg_name",
+        color="prevalence",
+        hover_name="region",
+    )
+    fig_map.update_geos(fitbounds="locations", visible=False)
+    fig_map.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+
+    map_title = f"Smoking prevalence map ({map_year})"
+
+    # Evidence panel for Region A
+    corr = corr_table(df, region_a, sex=sex, age_group=age_group)
+    corr_title = f"Correlation signals for {region_a} (with current filters)"
+
+    if corr.empty:
+        fig_corr = go.Figure()
+        fig_corr.update_layout(margin=dict(l=10, r=10, t=10, b=10))
     else:
-        # Correlations
-        if ev["corr_rows"]:
-            corr_table = dbc.Table(
-                [
-                    html.Thead(html.Tr([html.Th("Feature"), html.Th("Correlation with prevalence")])),
-                    html.Tbody(
-                        [
-                            html.Tr([html.Td(feat), html.Td(f"{val:.3f}")])
-                            for feat, val in sorted(ev["corr_rows"], key=lambda t: abs(t[1]), reverse=True)
-                        ]
-                    ),
-                ],
-                bordered=False,
-                hover=True,
-                responsive=True,
-                size="sm",
-            )
-            corr_block = html.Div(
-                [
-                    html.Div(f"Latest year used: {ev['latest_year']}", className="small-note"),
-                    corr_table,
-                ]
-            )
-        else:
-            corr_block = dbc.Alert("Correlation features not found (need columns like unemployment_rate, policy_index, sunshine_hours).", color="secondary")
+        fig_corr = px.bar(corr, x="correlation", y="feature", orientation="h")
+        fig_corr.update_layout(margin=dict(l=10, r=10, t=10, b=10), yaxis_title="", xaxis_title="correlation")
 
-        # Regression
-        if ev["reg"]:
-            reg = ev["reg"]
-            coef_table = dbc.Table(
-                [
-                    html.Thead(html.Tr([html.Th("Feature"), html.Th("Coefficient")])),
-                    html.Tbody([html.Tr([html.Td(f), html.Td(f"{c:.6f}")]) for f, c in reg["coefs"]]),
-                ],
-                bordered=False,
-                hover=True,
-                responsive=True,
-                size="sm",
-            )
-            reg_block = html.Div(
-                [
-                    html.Div(f"Latest year used: {reg['latest_year']}", className="small-note"),
-                    html.Div(f"Model R² = {reg['r2']:.3f}", style={"fontWeight": 700, "marginTop": "6px"}),
-                    html.Div(
-                        f"Strongest structural driver: {reg['strongest_driver']} (coef {reg['strongest_coef']:.3f})"
-                        if reg["strongest_driver"]
-                        else "Strongest structural driver: —",
-                        className="small-note",
-                    ),
-                    html.Div(style={"height": "6px"}),
-                    coef_table,
-                ]
-            )
-        else:
-            reg_block = dbc.Alert("Not enough data or missing driver columns for regression.", color="secondary")
+    reg = linear_regression_numpy(df, region_a, sex=sex, age_group=age_group)
+    reg_title = f"Regression evidence for {region_a} (OLS via numpy)"
+    coef_df = reg["coefficients"]
+    r2 = reg["r2"]
+
+    if coef_df.empty:
+        fig_coef = go.Figure()
+        fig_coef.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+        reg_summary = "No regression model could be estimated for the current filters (missing columns or too few rows)."
+    else:
+        fig_coef = px.bar(coef_df, x="coefficient", y="feature", orientation="h")
+        fig_coef.update_layout(margin=dict(l=10, r=10, t=10, b=10), yaxis_title="", xaxis_title="coefficient")
+        reg_summary = evidence_summary_text(region_a, r2, coef_df)
 
     return (
-        kpi_a_latest,
-        kpi_b_latest,
-        kpi_diff,
-        kpi_a_change,
-        kpi_b_change,
-        kpi_rank,
-        fig_trend,
-        fig_map,
-        map_title,
-        corr_block,
-        reg_block,
+        kpi_a, kpi_b, kpi_d, kpi_ca, kpi_cb, kpi_r,
+        fig_trend, fig_map, map_title,
+        corr_title, fig_corr,
+        reg_title, fig_coef, dcc.Markdown(reg_summary),
     )
 
 
-# -----------------------------
-# AI Assistant callback (button-only trigger)
-# -----------------------------
-@callback(
-    Output("ai_output", "children"),
+@app.callback(
     Output("ai_status", "children"),
+    Output("ai_status", "is_open"),
     Output("ai_status", "color"),
+    Output("ai_answer", "children"),
     Input("ai_send", "n_clicks"),
-    State("ai_input", "value"),
+    State("ai_question", "value"),
     State("region_a", "value"),
     State("region_b", "value"),
     State("year_range", "value"),
@@ -824,68 +653,42 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
     State("age_group", "value"),
     prevent_initial_call=True,
 )
-def ai_assistant(n_clicks, question, region_a, region_b, year_range, sex, age_group):
-    if not n_clicks:
-        return no_update, no_update, no_update
-
-    if not question or not str(question).strip():
-        return "Type a question first.", "Ready.", "secondary"
-
-    # quick config check
-    if not OPENAI_API_KEY or not OpenAI:
-        return (
-            "AI Assistant is not configured. Add OPENAI_API_KEY in Railway Variables to enable it.",
-            "AI is not configured. Set OPENAI_API_KEY in Railway Variables.",
-            "secondary",
-        )
+def handle_ai(n, question, region_a, region_b, year_range, sex, age_group):
+    if not question or not question.strip():
+        return "Type a question first.", True, "warning", ""
 
     y0, y1 = int(year_range[0]), int(year_range[1])
-    df_filtered = filter_df(DF, year_min=y0, year_max=y1, sex=sex, age_group=age_group)
 
-    kpi_a = compute_kpis_for_region(df_filtered, region_a)
-    kpi_b = compute_kpis_for_region(df_filtered, region_b)
-    rank_map, rank_year = compute_rank_latest(df_filtered)
-    ra = rank_map.get(region_a, None)
-    rb = rank_map.get(region_b, None)
+    # Lightweight context
+    a_latest, a_y = region_latest_prevalence(df, region_a, sex=sex, age_group=age_group)
+    b_latest, b_y = region_latest_prevalence(df, region_b, sex=sex, age_group=age_group)
+    diff = (a_latest - b_latest) if (not pd.isna(a_latest) and not pd.isna(b_latest)) else np.nan
 
-    ev = evidence_panel_data(df_filtered)
-    reg_summary = ""
-    if ev and ev.get("reg"):
-        reg = ev["reg"]
-        reg_summary = f"Regression R2={reg['r2']:.3f}; strongest_driver={reg['strongest_driver']} (coef={reg['strongest_coef']:.3f})."
+    reg = linear_regression_numpy(df, region_a, sex=sex, age_group=age_group)
+    coef_df = reg["coefficients"].head(4)
+    r2 = reg["r2"]
 
-    # grounded context
-    context = f"""
-Filters:
-- Region A: {region_a}
-- Region B: {region_b}
-- Year range: {y0} to {y1}
-- Sex: {sex}
-- Age group: {age_group}
-
-Current KPIs:
-- A latest: {fmt_pct(kpi_a['latest'])} (year {kpi_a['latest_year']}), change: {fmt_pp(kpi_a['change'])} ({kpi_a['change_span']}), peak: {fmt_pct(kpi_a['peak'])} ({kpi_a['peak_year']}), rank: {ra}
-- B latest: {fmt_pct(kpi_b['latest'])} (year {kpi_b['latest_year']}), change: {fmt_pp(kpi_b['change'])} ({kpi_b['change_span']}), peak: {fmt_pct(kpi_b['peak'])} ({kpi_b['peak_year']}), rank: {rb}
-
-Evidence:
-{reg_summary if reg_summary else "No regression evidence available under current filters."}
-""".strip()
-
-    system_msg = (
-        "You are a careful data analyst. "
-        "Answer using ONLY the provided context, and be explicit when something is not available. "
-        "Keep it concise but insightful: 5-10 sentences, plus 2-4 bullet recommendations."
+    context = (
+        f"Filters: Region A={region_a}, Region B={region_b}, Years={y0}-{y1}, Sex={sex}, Age={age_group}\n"
+        f"Latest A: {a_latest:.2f}% (year {a_y})\n"
+        f"Latest B: {b_latest:.2f}% (year {b_y})\n"
+        f"Diff (A-B): {diff:+.2f} pp\n"
+        f"Regression (Region A) R2: {r2:.2f}\n"
+        f"Top coefficients:\n{coef_df.to_string(index=False)}\n"
     )
-    user_msg = f"{context}\n\nUser question:\n{question.strip()}\n"
 
-    ok, text = call_openai_chat(system_msg, user_msg)
+    ok, text = ai_answer(question.strip(), context)
+
     if ok:
-        return text, f"AI ready (model: {OPENAI_MODEL}).", "success"
-    return text, "AI request failed. If you see 429, wait 10–30 seconds and retry.", "warning"
+        return "AI Assistant is active.", True, "success", text
+    else:
+        # When not configured / rate-limited / other errors
+        return text, True, "secondary", ""
 
 
-# -----------------------------
-# Run
-# -----------------------------
+# ------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    app.run_server(host="0.0.0.0", port=EXPOSE_PORT, debug=False)
+    # For local dev
+    app.run_server(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
