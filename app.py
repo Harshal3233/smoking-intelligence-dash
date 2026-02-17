@@ -175,46 +175,74 @@ def evidence_summary_text(region: str, r2: float, coef_df: pd.DataFrame) -> str:
 
 
 # ------------------------------------------------------------
-# OpenAI helper (optional)
+# OpenAI helper (optional) - FIXED for Railway proxy crash
 # ------------------------------------------------------------
+_LAST_AI_CALL_TS = 0.0  # in-process throttle
+
+
+def _strip_proxy_env():
+    # Prevent OpenAI SDK -> httpx proxy wiring causing:
+    # TypeError: Client.__init__() got an unexpected keyword argument 'proxies'
+    for k in [
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    ]:
+        os.environ.pop(k, None)
+
+
 def ai_answer(question: str, context: str) -> tuple[bool, str]:
     """
     Returns (ok, text). If not configured or errors, returns ok=False with message.
+    Uses chat.completions (stable) and strips proxy env vars (Railway fix).
     """
+    global _LAST_AI_CALL_TS
+
     if not OPENAI_API_KEY:
         return False, "AI Assistant is not configured. Add OPENAI_API_KEY in Railway Variables to enable it."
 
+    # Light throttle to reduce accidental spam (and 429s)
+    now = time.time()
+    if now - _LAST_AI_CALL_TS < 2.0:
+        return False, "You're sending requests too fast. Wait 2 seconds and try again."
+    _LAST_AI_CALL_TS = now
+
     try:
+        _strip_proxy_env()
         from openai import OpenAI
     except Exception:
         return False, "Missing dependency: openai. Add `openai` to requirements.txt."
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    system = (
-        "You are a data analyst assistant for a Dash dashboard about smoking prevalence in Italian regions. "
-        "Answer using the provided context only. Be concise, factual, and reference the numbers given."
-    )
-
-    user = f"Context:\n{context}\n\nUser question:\n{question}"
-
     try:
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        system = (
+            "You are a data analyst assistant for a Dash dashboard about smoking prevalence in Italian regions. "
+            "Answer using the provided context only. Be concise, factual, and reference the numbers given."
+        )
+        user = f"Context:\n{context}\n\nUser question:\n{question}"
+
+        # Use a compact response to keep cost + rate-limits down
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,  # you set this to gpt-4o-mini in Railway Variables
+            messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_output_tokens=350,
+            temperature=0.2,
+            max_tokens=350,
         )
-        text = resp.output_text.strip()
+
+        text = (resp.choices[0].message.content or "").strip()
         return True, text if text else "No response text returned."
+
     except Exception as e:
         msg = str(e)
-        # Helpful handling for rate limits
-        if "429" in msg or "rate limit" in msg.lower():
-            return False, "AI request failed (status 429). You hit a rate limit or quota. Try again later or lower usage."
-        return False, f"AI request failed: {msg}"
+        if "429" in msg or "rate limit" in msg.lower() or "insufficient_quota" in msg.lower():
+            return False, (
+                "AI request failed (429). This usually means rate limit or quota. "
+                "Try again in a bit, reduce frequency, or check OpenAI billing/limits."
+            )
+        return False, f"AI request failed: {type(e).__name__}: {msg}"
 
 
 # ------------------------------------------------------------
@@ -572,7 +600,7 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
         f"Year {rank_year}",
     )
 
-    # Trend figure (ensure title never "cuts")
+    # Trend figure
     d_trend = apply_filters(df, year_min=y0, year_max=y1, sex=sex, age_group=age_group)
     d_a = d_trend[d_trend["region"] == region_a].groupby("year", as_index=False)["prevalence"].mean()
     d_b = d_trend[d_trend["region"] == region_b].groupby("year", as_index=False)["prevalence"].mean()
@@ -589,7 +617,7 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
         hovermode="x unified",
     )
 
-    # Map figure for selected year
+    # Map figure
     d_map = apply_filters(df, year_min=map_year, year_max=map_year, sex=sex, age_group=age_group)
     d_map = d_map.groupby("region", as_index=False)["prevalence"].mean()
 
@@ -606,7 +634,7 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
 
     map_title = f"Smoking prevalence map ({map_year})"
 
-    # Evidence panel for Region A
+    # Evidence panel
     corr = corr_table(df, region_a, sex=sex, age_group=age_group)
     corr_title = f"Correlation signals for {region_a} (with current filters)"
 
@@ -659,7 +687,6 @@ def handle_ai(n, question, region_a, region_b, year_range, sex, age_group):
 
     y0, y1 = int(year_range[0]), int(year_range[1])
 
-    # Lightweight context
     a_latest, a_y = region_latest_prevalence(df, region_a, sex=sex, age_group=age_group)
     b_latest, b_y = region_latest_prevalence(df, region_b, sex=sex, age_group=age_group)
     diff = (a_latest - b_latest) if (not pd.isna(a_latest) and not pd.isna(b_latest)) else np.nan
@@ -682,7 +709,6 @@ def handle_ai(n, question, region_a, region_b, year_range, sex, age_group):
     if ok:
         return "AI Assistant is active.", True, "success", text
     else:
-        # When not configured / rate-limited / other errors
         return text, True, "secondary", ""
 
 
@@ -690,5 +716,4 @@ def handle_ai(n, question, region_a, region_b, year_range, sex, age_group):
 # Entrypoint
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    # For local dev
     app.run_server(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
