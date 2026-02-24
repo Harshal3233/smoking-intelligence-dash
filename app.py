@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import numpy as np
 import pandas as pd
 
@@ -21,6 +22,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 APP_TITLE = "SMOKING INTELLIGENCE PLATFORM"
 APP_SUBTITLE = "Regional trends, comparative analysis, and forecasting"
 
+# Optional: prevent accidental spam during demo
+AI_COOLDOWN_SECONDS = int(os.getenv("AI_COOLDOWN_SECONDS", "8"))
+_last_ai_call = {"ts": 0.0}
+
 
 # ------------------------------------------------------------
 # Helpers: data + stats
@@ -38,14 +43,7 @@ def safe_read_geojson(path: str) -> dict:
         return json.load(f)
 
 
-def apply_filters(
-    df: pd.DataFrame,
-    region=None,
-    year_min=None,
-    year_max=None,
-    sex=None,
-    age_group=None,
-) -> pd.DataFrame:
+def apply_filters(df: pd.DataFrame, region=None, year_min=None, year_max=None, sex=None, age_group=None) -> pd.DataFrame:
     out = df.copy()
 
     if region and region != "All":
@@ -69,7 +67,7 @@ def latest_year(df: pd.DataFrame) -> int:
     return int(df["year"].max())
 
 
-def region_latest_prevalence(df: pd.DataFrame, region: str, sex="All", age_group="All"):
+def region_latest_prevalence(df: pd.DataFrame, region: str, sex="All", age_group="All") -> tuple[float, int]:
     d = apply_filters(df, region=region, sex=sex, age_group=age_group)
     if d.empty:
         return (np.nan, np.nan)
@@ -89,7 +87,7 @@ def change_over_period(df: pd.DataFrame, region: str, y0: int, y1: int, sex="All
     return float(v1 - v0)
 
 
-def peak_value(df: pd.DataFrame, region: str, sex="All", age_group="All"):
+def peak_value(df: pd.DataFrame, region: str, sex="All", age_group="All") -> tuple[float, int]:
     d = apply_filters(df, region=region, sex=sex, age_group=age_group)
     if d.empty:
         return (np.nan, np.nan)
@@ -97,7 +95,7 @@ def peak_value(df: pd.DataFrame, region: str, sex="All", age_group="All"):
     return float(d.loc[idx, "prevalence"]), int(d.loc[idx, "year"])
 
 
-def national_rank_latest(df: pd.DataFrame, region: str, sex="All", age_group="All"):
+def national_rank_latest(df: pd.DataFrame, region: str, sex="All", age_group="All") -> tuple[int, int]:
     d = apply_filters(df, sex=sex, age_group=age_group)
     if d.empty:
         return (np.nan, np.nan)
@@ -130,7 +128,15 @@ def linear_regression_numpy(df: pd.DataFrame, region: str, sex="All", age_group=
     Simple OLS regression using numpy (no sklearn dependency).
     Predicts prevalence from available features:
     unemployment_rate, policy_index, sunshine_hours, year (if present).
-    Returns dict: R2, coefficients table.
+
+    Returns:
+      - r2 (float)
+      - coefficients (df: feature, coefficient) sorted by |coef|
+      - n (int)
+      - y (np.array)
+      - y_hat (np.array)
+      - residuals (np.array)
+      - features (list[str])
     """
     d = apply_filters(df, region=region, sex=sex, age_group=age_group).dropna()
 
@@ -138,7 +144,15 @@ def linear_regression_numpy(df: pd.DataFrame, region: str, sex="All", age_group=
     features = [f for f in feature_candidates if f in d.columns]
 
     if d.empty or len(features) == 0 or "prevalence" not in d.columns:
-        return {"r2": np.nan, "coefficients": pd.DataFrame(columns=["feature", "coefficient"])}
+        return {
+            "r2": np.nan,
+            "coefficients": pd.DataFrame(columns=["feature", "coefficient"]),
+            "n": 0,
+            "y": np.array([]),
+            "y_hat": np.array([]),
+            "residuals": np.array([]),
+            "features": [],
+        }
 
     X = d[features].astype(float).values
     y = d["prevalence"].astype(float).values.reshape(-1, 1)
@@ -152,8 +166,10 @@ def linear_regression_numpy(df: pd.DataFrame, region: str, sex="All", age_group=
     except np.linalg.LinAlgError:
         beta = np.linalg.pinv(X_design) @ y
 
-    y_hat = X_design @ beta
-    ss_res = float(((y - y_hat) ** 2).sum())
+    y_hat = (X_design @ beta).astype(float)
+    residuals = (y - y_hat).astype(float)
+
+    ss_res = float((residuals ** 2).sum())
     ss_tot = float(((y - y.mean()) ** 2).sum())
     r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
 
@@ -161,7 +177,15 @@ def linear_regression_numpy(df: pd.DataFrame, region: str, sex="All", age_group=
     coef_df = pd.DataFrame({"feature": features, "coefficient": coef.astype(float)})
     coef_df = coef_df.sort_values("coefficient", key=lambda s: s.abs(), ascending=False)
 
-    return {"r2": float(r2), "coefficients": coef_df}
+    return {
+        "r2": float(r2),
+        "coefficients": coef_df,
+        "n": int(len(d)),
+        "y": y.flatten(),
+        "y_hat": y_hat.flatten(),
+        "residuals": residuals.flatten(),
+        "features": features,
+    }
 
 
 def evidence_summary_text(region: str, r2: float, coef_df: pd.DataFrame) -> str:
@@ -171,21 +195,42 @@ def evidence_summary_text(region: str, r2: float, coef_df: pd.DataFrame) -> str:
     top = coef_df.iloc[0]
     driver = str(top["feature"])
     effect = float(top["coefficient"])
-
     direction = "increases" if effect > 0 else "decreases"
+
     return (
-        f"For {region}, the strongest structural driver in the linear model is **{driver}** "
-        f"(coefficient {effect:+.3f}), meaning higher {driver} {direction} predicted prevalence in this dataset. "
+        f"For **{region}**, the strongest structural driver in the linear model is **{driver}** "
+        f"(coefficient {effect:+.3f}). In this dataset, higher {driver} **{direction}** predicted prevalence.\n\n"
         f"Model fit: **R² = {r2:.2f}**."
     )
+
+
+def r2_label(r2: float) -> str:
+    if pd.isna(r2):
+        return "Not available"
+    if r2 >= 0.70:
+        return "Strong"
+    if r2 >= 0.40:
+        return "Moderate"
+    return "Weak"
+
+
+def safe_get_coef(coef_df: pd.DataFrame, name: str) -> float:
+    if coef_df is None or coef_df.empty:
+        return np.nan
+    row = coef_df[coef_df["feature"] == name]
+    if row.empty:
+        return np.nan
+    return float(row["coefficient"].iloc[0])
 
 
 # ------------------------------------------------------------
 # OpenAI helper (optional)
 # ------------------------------------------------------------
-def ai_answer(question: str, context: str):
+def ai_answer(question: str, context: str) -> tuple[bool, str]:
     """
-    Returns (ok, text). If not configured or errors, returns ok=False with message.
+    Returns (ok, text). Uses a compatibility approach:
+    - Try client.responses.create (new SDK)
+    - Fallback to client.chat.completions.create
     """
     if not OPENAI_API_KEY:
         return False, "AI Assistant is not configured. Add OPENAI_API_KEY in Railway Variables to enable it."
@@ -195,7 +240,6 @@ def ai_answer(question: str, context: str):
     except Exception:
         return False, "Missing dependency: openai. Add `openai` to requirements.txt."
 
-    # NOTE: We intentionally keep this minimal to avoid changing the project structure.
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     system = (
@@ -204,6 +248,7 @@ def ai_answer(question: str, context: str):
     )
     user = f"Context:\n{context}\n\nUser question:\n{question}"
 
+    # Try new Responses API first
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
@@ -211,14 +256,33 @@ def ai_answer(question: str, context: str):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_output_tokens=350,
+            max_output_tokens=320,
         )
-        text = resp.output_text.strip()
+        text = getattr(resp, "output_text", "") or ""
+        text = text.strip()
         return True, text if text else "No response text returned."
+    except Exception:
+        pass
+
+    # Fallback: chat.completions
+    try:
+        resp2 = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=320,
+        )
+        text2 = resp2.choices[0].message.content.strip()
+        return True, text2 if text2 else "No response text returned."
     except Exception as e:
         msg = str(e)
         if "429" in msg or "rate limit" in msg.lower():
-            return False, "AI request failed (429). This usually means rate limit or quota. Try again in a bit, reduce frequency, or check OpenAI billing/limits."
+            return False, "AI request failed (429). Rate limit or quota. Check OpenAI billing/limits or reduce frequency."
+        if "401" in msg or "invalid_api_key" in msg.lower():
+            return False, "AI request failed (401). Invalid API key. Regenerate the key and update Railway variable."
         return False, f"AI request failed: {msg}"
 
 
@@ -284,7 +348,7 @@ def kpi_card(title, value, subtitle=None):
 
 
 # ------------------------------------------------------------
-# Layout (same dashboard, tabs restored, ONLY label change: Sex -> Gender)
+# Layout
 # ------------------------------------------------------------
 sidebar = dbc.Card(
     dbc.CardBody(
@@ -319,10 +383,10 @@ sidebar = dbc.Card(
                 allowCross=False,
             ),
 
-            # ✅ ONLY CHANGE YOU ASKED FOR:
-            dbc.Label("Gender", style={"marginTop": "12px"}),  # <-- was "Sex"
+            # Only requested change: label "Gender" (keep id="sex" to avoid breaking anything)
+            dbc.Label("Gender", style={"marginTop": "12px"}),
             dcc.Dropdown(
-                id="sex",  # keep id SAME so nothing else changes
+                id="sex",
                 options=[{"label": s, "value": s} for s in sex_values],
                 value="All",
                 clearable=False,
@@ -386,50 +450,139 @@ comparison_tab = dbc.Container(
     ],
 )
 
-evidence_tab = dbc.Card(
-    dbc.CardBody(
-        [
-            html.Div("Evidence panel", style={"fontSize": "24px", "fontWeight": 700, "marginBottom": "6px"}),
-            html.Div(
-                "Evidence is computed from your current filters (Region A, Gender, Age group). "
-                "Use it to justify comparisons with numbers.",
-                style={**MUTED, "marginBottom": "14px"},
-            ),
-            dbc.Accordion(
+# Evidence: add all 4 upgrades (KPI row, diagnostics, narrative, scenario)
+evidence_tab = dbc.Container(
+    fluid=True,
+    children=[
+        dbc.Card(
+            dbc.CardBody(
                 [
-                    dbc.AccordionItem(
-                        [
-                            html.Div(id="corr_title", style={"fontWeight": 650, "marginBottom": "10px"}),
-                            dcc.Graph(id="corr_bar", config=GRAPH_CONFIG, style={"height": "320px"}),
-                        ],
-                        title="Correlations",
+                    html.Div("Evidence panel", style={"fontSize": "24px", "fontWeight": 700, "marginBottom": "6px"}),
+                    html.Div(
+                        "Evidence is computed from your current filters (Region A, Gender, Age group). "
+                        "Use it to justify comparisons with numbers.",
+                        style={**MUTED, "marginBottom": "14px"},
                     ),
-                    dbc.AccordionItem(
+
+                    # Upgrade 1: Evidence KPI cards
+                    dbc.Row(
                         [
-                            html.Div(id="reg_title", style={"fontWeight": 650, "marginBottom": "10px"}),
-                            dcc.Graph(id="reg_coef", config=GRAPH_CONFIG, style={"height": "320px"}),
-                            html.Div(id="reg_summary", style={"marginTop": "10px"}),
+                            dbc.Col(kpi_card("Model R²", "—", "Fit strength"), md=3, id="ev_kpi_r2"),
+                            dbc.Col(kpi_card("Top driver", "—", "Largest |coefficient|"), md=3, id="ev_kpi_driver"),
+                            dbc.Col(kpi_card("Direction", "—", "Effect sign"), md=3, id="ev_kpi_dir"),
+                            dbc.Col(kpi_card("Samples (N)", "—", "Rows used"), md=3, id="ev_kpi_n"),
                         ],
-                        title="Regression evidence",
+                        className="g-3",
+                        style={"marginBottom": "14px"},
                     ),
-                ],
-                start_collapsed=True,
+
+                    dbc.Accordion(
+                        [
+                            dbc.AccordionItem(
+                                [
+                                    html.Div(id="corr_title", style={"fontWeight": 650, "marginBottom": "10px"}),
+                                    dcc.Graph(id="corr_bar", config=GRAPH_CONFIG, style={"height": "320px"}),
+                                ],
+                                title="Correlations",
+                            ),
+
+                            dbc.AccordionItem(
+                                [
+                                    html.Div(id="reg_title", style={"fontWeight": 650, "marginBottom": "10px"}),
+                                    dcc.Graph(id="reg_coef", config=GRAPH_CONFIG, style={"height": "320px"}),
+                                    html.Div(id="reg_summary", style={"marginTop": "10px"}),
+                                    # Upgrade 3: confidence + caveats narrative
+                                    html.Div(id="evidence_notes", style={"marginTop": "10px"}),
+                                ],
+                                title="Regression evidence",
+                            ),
+
+                            # Upgrade 2: diagnostics
+                            dbc.AccordionItem(
+                                [
+                                    html.Div("Diagnostics (Region A model)", style={"fontWeight": 650, "marginBottom": "10px"}),
+                                    dcc.Graph(id="diag_actual_pred", config=GRAPH_CONFIG, style={"height": "320px"}),
+                                    dcc.Graph(id="diag_residuals", config=GRAPH_CONFIG, style={"height": "280px"}),
+                                ],
+                                title="Model diagnostics",
+                            ),
+
+                            # Upgrade 4: scenario panel
+                            dbc.AccordionItem(
+                                [
+                                    html.Div("What-if scenario (based on Region A coefficients)", style={"fontWeight": 650, "marginBottom": "6px"}),
+                                    html.Div(
+                                        "Move the sliders to simulate how predicted prevalence would change, "
+                                        "holding other factors constant. This is a linear sensitivity view, not causal proof.",
+                                        style={**MUTED, "marginBottom": "12px"},
+                                    ),
+
+                                    dbc.Row(
+                                        [
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Unemployment change (percentage points)"),
+                                                    dcc.Slider(
+                                                        id="sc_unemp",
+                                                        min=-5, max=5, step=0.5, value=0,
+                                                        marks={-5: "-5", 0: "0", 5: "+5"},
+                                                    ),
+                                                ],
+                                                md=4,
+                                            ),
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Policy index change (index units)"),
+                                                    dcc.Slider(
+                                                        id="sc_policy",
+                                                        min=-10, max=10, step=1, value=0,
+                                                        marks={-10: "-10", 0: "0", 10: "+10"},
+                                                    ),
+                                                ],
+                                                md=4,
+                                            ),
+                                            dbc.Col(
+                                                [
+                                                    dbc.Label("Sunshine change (hours)"),
+                                                    dcc.Slider(
+                                                        id="sc_sun",
+                                                        min=-200, max=200, step=25, value=0,
+                                                        marks={-200: "-200", 0: "0", 200: "+200"},
+                                                    ),
+                                                ],
+                                                md=4,
+                                            ),
+                                        ],
+                                        className="g-3",
+                                    ),
+
+                                    html.Div(style={"height": "10px"}),
+                                    html.Div(id="scenario_out"),
+                                ],
+                                title="Scenario simulation",
+                            ),
+                        ],
+                        start_collapsed=True,
+                    ),
+                ]
             ),
-        ]
-    ),
-    style=CARD_STYLE,
+            style=CARD_STYLE,
+        )
+    ],
 )
 
-ai_tab = dbc.Card(
+assistant_tab = dbc.Card(
     dbc.CardBody(
         [
             html.Div("AI Assistant", style={"fontSize": "26px", "fontWeight": 750, "marginBottom": "6px"}),
             html.Div(
                 "Ask a question and get an explanation grounded in your current filters. "
-                'Example: "Why is Region A higher than Region B?" or "What should I check next?"',
+                'Example: "Why is Region A higher than Region B?" or "What is the strongest driver for Region A?"',
                 style={**MUTED, "marginBottom": "10px"},
             ),
+
             dbc.Alert(id="ai_status", color="secondary", children="", is_open=False),
+
             dbc.Row(
                 [
                     dbc.Col(
@@ -448,10 +601,10 @@ ai_tab = dbc.Card(
                 ],
                 className="g-2",
             ),
+
             html.Div(id="ai_answer", style={"whiteSpace": "pre-wrap", "marginTop": "12px"}),
             html.Div(
-                "Note: The assistant activates when OPENAI_API_KEY is set in Railway Variables. "
-                f"Model: {OPENAI_MODEL}",
+                "Note: The assistant activates when OPENAI_API_KEY is set in Railway Variables.",
                 style={**MUTED, "marginTop": "8px", "fontSize": "13px"},
             ),
         ]
@@ -474,19 +627,20 @@ app.layout = dbc.Container(
         dbc.Row(
             [
                 dbc.Col(sidebar, md=3),
+
                 dbc.Col(
                     [
-                        # Tabs up top (Comparison / Evidence / AI)
                         dbc.Tabs(
                             [
                                 dbc.Tab(comparison_tab, label="Comparison", tab_id="tab-compare"),
                                 dbc.Tab(evidence_tab, label="Evidence", tab_id="tab-evidence"),
-                                dbc.Tab(ai_tab, label="Assistant", tab_id="tab-ai"),
+                                dbc.Tab(assistant_tab, label="Assistant", tab_id="tab-ai"),
                             ],
                             id="main_tabs",
                             active_tab="tab-compare",
                             style={"marginBottom": "12px"},
                         ),
+
                         html.Div(style={"height": "10px"}),
                         html.Div("Built with Dash. Deployed on Railway.", style={**MUTED, "fontSize": "13px"}),
                     ],
@@ -503,6 +657,7 @@ app.layout = dbc.Container(
 # Callbacks
 # ------------------------------------------------------------
 @app.callback(
+    # Comparison KPIs + graphs
     Output("kpi_latest_a", "children"),
     Output("kpi_latest_b", "children"),
     Output("kpi_diff", "children"),
@@ -512,21 +667,39 @@ app.layout = dbc.Container(
     Output("trend_graph", "figure"),
     Output("map_graph", "figure"),
     Output("map_title", "children"),
+
+    # Evidence panel outputs
+    Output("ev_kpi_r2", "children"),
+    Output("ev_kpi_driver", "children"),
+    Output("ev_kpi_dir", "children"),
+    Output("ev_kpi_n", "children"),
     Output("corr_title", "children"),
     Output("corr_bar", "figure"),
     Output("reg_title", "children"),
     Output("reg_coef", "figure"),
     Output("reg_summary", "children"),
+    Output("evidence_notes", "children"),
+    Output("diag_actual_pred", "figure"),
+    Output("diag_residuals", "figure"),
+    Output("scenario_out", "children"),
+
+    # Inputs
     Input("region_a", "value"),
     Input("region_b", "value"),
     Input("year_range", "value"),
-    Input("sex", "value"),         # keep same id
+    Input("sex", "value"),
     Input("age_group", "value"),
     Input("map_year", "value"),
+    Input("sc_unemp", "value"),
+    Input("sc_policy", "value"),
+    Input("sc_sun", "value"),
 )
-def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
+def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year, sc_unemp, sc_policy, sc_sun):
     y0, y1 = int(year_range[0]), int(year_range[1])
 
+    # -------------------
+    # KPIs (comparison)
+    # -------------------
     a_latest, a_y = region_latest_prevalence(df, region_a, sex=sex, age_group=age_group)
     b_latest, b_y = region_latest_prevalence(df, region_b, sex=sex, age_group=age_group)
     diff = (a_latest - b_latest) if (not pd.isna(a_latest) and not pd.isna(b_latest)) else np.nan
@@ -571,7 +744,9 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
         f"Year {rank_year}",
     )
 
-    # Trend
+    # -------------------
+    # Trend figure
+    # -------------------
     d_trend = apply_filters(df, year_min=y0, year_max=y1, sex=sex, age_group=age_group)
     d_a = d_trend[d_trend["region"] == region_a].groupby("year", as_index=False)["prevalence"].mean()
     d_b = d_trend[d_trend["region"] == region_b].groupby("year", as_index=False)["prevalence"].mean()
@@ -587,7 +762,9 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
         hovermode="x unified",
     )
 
-    # Map
+    # -------------------
+    # Map figure
+    # -------------------
     d_map = apply_filters(df, year_min=map_year, year_max=map_year, sex=sex, age_group=age_group)
     d_map = d_map.groupby("region", as_index=False)["prevalence"].mean()
 
@@ -603,7 +780,9 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
     fig_map.update_layout(margin=dict(l=10, r=10, t=10, b=10))
     map_title = f"Smoking prevalence map ({map_year})"
 
-    # Evidence (Region A)
+    # -------------------
+    # Evidence: correlations + regression + diagnostics + scenario
+    # -------------------
     corr = corr_table(df, region_a, sex=sex, age_group=age_group)
     corr_title = f"Correlation signals for {region_a} (with current filters)"
     if corr.empty:
@@ -614,24 +793,124 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
         fig_corr.update_layout(margin=dict(l=10, r=10, t=10, b=10), yaxis_title="", xaxis_title="correlation")
 
     reg = linear_regression_numpy(df, region_a, sex=sex, age_group=age_group)
-    reg_title = f"Regression evidence for {region_a} (OLS via numpy)"
     coef_df = reg["coefficients"]
     r2 = reg["r2"]
+    n = reg["n"]
+    y = reg["y"]
+    y_hat = reg["y_hat"]
+    residuals = reg["residuals"]
 
-    if coef_df.empty:
+    reg_title = f"Regression evidence for {region_a} (OLS via numpy)"
+
+    # Evidence KPI cards (upgrade 1)
+    if coef_df.empty or pd.isna(r2) or n == 0:
+        ev_r2 = kpi_card("Model R²", "—", "Fit strength")
+        ev_driver = kpi_card("Top driver", "—", "Largest |coefficient|")
+        ev_dir = kpi_card("Direction", "—", "Effect sign")
+        ev_n = kpi_card("Samples (N)", "—", "Rows used")
+
         fig_coef = go.Figure()
         fig_coef.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-        reg_summary = "No regression model could be estimated for the current filters (missing columns or too few rows)."
+
+        reg_summary = dcc.Markdown("No regression model could be estimated for the current filters (missing columns or too few rows).")
+        notes = dcc.Markdown("**Evidence notes:** Not available (insufficient data under current filters).")
+
+        fig_ap = go.Figure()
+        fig_ap.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+
+        fig_res = go.Figure()
+        fig_res.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+
+        scenario_out = dcc.Markdown("Scenario simulation is not available for the current filters.")
     else:
+        top = coef_df.iloc[0]
+        top_driver = str(top["feature"])
+        top_coef = float(top["coefficient"])
+        top_dir = "Positive" if top_coef > 0 else "Negative"
+
+        ev_r2 = kpi_card("Model R²", f"{r2:.2f}", r2_label(r2))
+        ev_driver = kpi_card("Top driver", top_driver, "Largest |coefficient|")
+        ev_dir = kpi_card("Direction", top_dir, f"Coef {top_coef:+.3f}")
+        ev_n = kpi_card("Samples (N)", f"{n}", "Rows used")
+
         fig_coef = px.bar(coef_df, x="coefficient", y="feature", orientation="h")
         fig_coef.update_layout(margin=dict(l=10, r=10, t=10, b=10), yaxis_title="", xaxis_title="coefficient")
-        reg_summary = evidence_summary_text(region_a, r2, coef_df)
 
+        reg_summary = dcc.Markdown(evidence_summary_text(region_a, r2, coef_df))
+
+        # Upgrade 3: confidence + caveats narrative
+        caveats = (
+            f"**Evidence notes:**\n"
+            f"- Sample size (N): **{n}** rows under current filters.\n"
+            f"- R² interpretation: **{r2_label(r2)}** (higher means better in-sample fit).\n"
+            f"- Coefficients show associations in this dataset; correlation is not causation.\n"
+            f"- Policy effects may appear with a lag; consider testing lagged policy_index in the next iteration.\n"
+        )
+        notes = dcc.Markdown(caveats)
+
+        # Upgrade 2: diagnostics
+        # Actual vs predicted
+        fig_ap = go.Figure()
+        fig_ap.add_trace(go.Scatter(x=y_hat, y=y, mode="markers", name="Obs"))
+        # 45-degree line
+        if len(y_hat) > 0 and len(y) > 0:
+            mn = float(min(np.min(y_hat), np.min(y)))
+            mx = float(max(np.max(y_hat), np.max(y)))
+            fig_ap.add_trace(go.Scatter(x=[mn, mx], y=[mn, mx], mode="lines", name="Perfect fit"))
+        fig_ap.update_layout(
+            margin=dict(l=45, r=15, t=20, b=45),
+            xaxis_title="Predicted prevalence",
+            yaxis_title="Actual prevalence",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+
+        # Residuals vs predicted
+        fig_res = go.Figure()
+        fig_res.add_trace(go.Scatter(x=y_hat, y=residuals, mode="markers", name="Residuals"))
+        fig_res.add_trace(go.Scatter(x=[float(np.min(y_hat)), float(np.max(y_hat))], y=[0, 0], mode="lines", name="Zero"))
+        fig_res.update_layout(
+            margin=dict(l=45, r=15, t=20, b=45),
+            xaxis_title="Predicted prevalence",
+            yaxis_title="Residual (actual - predicted)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+
+        # Upgrade 4: scenario simulation
+        c_unemp = safe_get_coef(coef_df, "unemployment_rate")
+        c_policy = safe_get_coef(coef_df, "policy_index")
+        c_sun = safe_get_coef(coef_df, "sunshine_hours")
+
+        # If a coefficient is missing, treat its contribution as 0
+        delta_pp = 0.0
+        details = []
+        if not pd.isna(c_unemp):
+            delta_pp += float(sc_unemp) * c_unemp
+            details.append(f"- unemployment_rate: {float(sc_unemp):+.1f} pp × {c_unemp:+.3f}")
+        if not pd.isna(c_policy):
+            delta_pp += float(sc_policy) * c_policy
+            details.append(f"- policy_index: {float(sc_policy):+.0f} × {c_policy:+.3f}")
+        if not pd.isna(c_sun):
+            delta_pp += float(sc_sun) * c_sun
+            details.append(f"- sunshine_hours: {float(sc_sun):+.0f} × {c_sun:+.6f}")
+
+        scenario_text = (
+            f"**Predicted change (linear sensitivity): {delta_pp:+.2f} percentage points**\n\n"
+            f"**Calculation details:**\n" + "\n".join(details) + "\n\n"
+            f"**Note:** This uses Region A model coefficients under current filters."
+        )
+        scenario_out = dcc.Markdown(scenario_text)
+
+    # Return all outputs
     return (
+        # Comparison KPIs + graphs
         kpi_a, kpi_b, kpi_d, kpi_ca, kpi_cb, kpi_r,
         fig_trend, fig_map, map_title,
+
+        # Evidence outputs
+        ev_r2, ev_driver, ev_dir, ev_n,
         corr_title, fig_corr,
-        reg_title, fig_coef, dcc.Markdown(reg_summary),
+        reg_title, fig_coef, reg_summary, notes,
+        fig_ap, fig_res, scenario_out
     )
 
 
@@ -645,13 +924,21 @@ def update_dashboard(region_a, region_b, year_range, sex, age_group, map_year):
     State("region_a", "value"),
     State("region_b", "value"),
     State("year_range", "value"),
-    State("sex", "value"),  # keep same id
+    State("sex", "value"),
     State("age_group", "value"),
     prevent_initial_call=True,
 )
 def handle_ai(n, question, region_a, region_b, year_range, sex, age_group):
     if not question or not question.strip():
         return "Type a question first.", True, "warning", ""
+
+    # Demo safety: cooldown
+    now = time.time()
+    if now - _last_ai_call["ts"] < AI_COOLDOWN_SECONDS:
+        wait = int(AI_COOLDOWN_SECONDS - (now - _last_ai_call["ts"]))
+        return f"Please wait {wait}s before sending another AI request.", True, "warning", ""
+
+    _last_ai_call["ts"] = now
 
     y0, y1 = int(year_range[0]), int(year_range[1])
 
@@ -660,8 +947,9 @@ def handle_ai(n, question, region_a, region_b, year_range, sex, age_group):
     diff = (a_latest - b_latest) if (not pd.isna(a_latest) and not pd.isna(b_latest)) else np.nan
 
     reg = linear_regression_numpy(df, region_a, sex=sex, age_group=age_group)
-    coef_df = reg["coefficients"].head(4)
+    coef_df = reg["coefficients"].head(6)
     r2 = reg["r2"]
+    n_rows = reg["n"]
 
     context = (
         f"Filters: Region A={region_a}, Region B={region_b}, Years={y0}-{y1}, Gender={sex}, Age={age_group}\n"
@@ -669,13 +957,16 @@ def handle_ai(n, question, region_a, region_b, year_range, sex, age_group):
         f"Latest B: {b_latest:.2f}% (year {b_y})\n"
         f"Diff (A-B): {diff:+.2f} pp\n"
         f"Regression (Region A) R2: {r2:.2f}\n"
+        f"Sample size N: {n_rows}\n"
         f"Top coefficients:\n{coef_df.to_string(index=False)}\n"
     )
 
     ok, text = ai_answer(question.strip(), context)
+
     if ok:
         return "AI Assistant is active.", True, "success", text
-    return text, True, "secondary", ""
+    else:
+        return text, True, "secondary", ""
 
 
 # ------------------------------------------------------------
